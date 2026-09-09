@@ -1,0 +1,37 @@
+# Imagery, labels and model binaries live outside version control.
+# They are large, and most of them are client data.
+data/
+model_files/
+*.tif
+*.tiff
+*.vrt
+*.gpkg
+*.parquet
+*.joblib
+*.rar
+*.zip
+*.shp
+*.shx
+*.dbf
+*.prj
+*.cpg
+*.qmd
+*.qgz
+
+# Credentials. The GCS service-account key lives here during development and
+# must never reach a remote, public or private.
+gcs_data_downloader*.json
+*service_account*.json
+*credentials*.json
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+.venv/
+venv/
+
+# Editor and OS
+.DS_Store
+Thumbs.db
