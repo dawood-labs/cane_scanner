@@ -17,6 +17,8 @@ shared:
     train         fitting, threshold selection and the model sidecar
     domain_check  refuses imagery outside the model's training distribution
     inference     classify a raster with the guard and the model's own threshold
+    phenology     shape-of-the-year features, for annual crop versus perennial
+    orchard_filter  drops perennial fields from a crop map, after the time-series model
 """
 
 from . import (
@@ -25,6 +27,8 @@ from . import (
     extract,
     features,
     inference,
+    orchard_filter,
+    phenology,
     stability,
     train,
     validate,
@@ -36,6 +40,8 @@ __all__ = [
     "extract",
     "features",
     "inference",
+    "orchard_filter",
+    "phenology",
     "stability",
     "train",
     "validate",
