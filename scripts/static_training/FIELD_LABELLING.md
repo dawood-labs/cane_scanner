@@ -95,18 +95,33 @@ which would lose the ground altogether.
 8 m, but eroding and dilating rounds every corner, which would be a worse change than
 the one being fixed. So the opened body is dilated slightly past its own radius and
 intersected back with the original, restoring the true edges and corners while leaving
-the tails outside. A polygon that would lose more than 10% this way is genuinely
-narrow rather than tailed and is left untouched. 18,230 of 19,777 polygons were
-trimmed.
+the tails outside.
+
+The first version of this had a clause saying "leave a polygon alone if it would lose
+more than 10%", meant to protect genuinely narrow fields. It protected exactly the
+wrong ones. The polygons that lose most to despiking are the ones that are mostly
+tail: one was 3.95 acres with a compactness of 0.021 and a solid body under it, and
+the clause was what kept its tails on. There is no such clause now. A polygon that
+vanishes entirely under a 4 m erosion was a line rather than a field, and 1,087 of
+them go; the rest keep their bodies. Afterwards a compactness floor of 0.10 catches
+what is still line-shaped, 74 of them, and a 0.05-acre floor catches bodies too small
+to be anything, 1,343.
+
+This runs on traced polygons too. The delineation owns the geometry, but a squiggle
+two metres wide and forty long is not geometry anybody drew on purpose.
+
+One threshold was also wrong in the other direction. The rectangle-fill floor sat at
+0.55, and a triangle fills exactly half its own rotated rectangle: triangular fields
+are real and were being rejected. It sits at 0.45 now.
 
 ## What comes out
 
 | origin | polygons | acres | of which cane |
 |---|---|---|---|
-| delineation, untouched | 16,977 | 17,474 | 4,476 |
-| split from a mixed polygon | 2,641 | 2,116 | 1,175 |
-| derived from the crop map | 318 | 223 | 223 |
-| **total** | **19,936** | **19,813** | **5,875** |
+| delineation, untouched | 15,919 | 17,131 | 4,465 |
+| split from a mixed polygon | 2,634 | 2,113 | 1,174 |
+| derived from the crop map | 331 | 279 | 279 |
+| **total** | **18,884** | **19,523** | **5,918** |
 
 No invalid geometry and no overlapping area. Of the 7,237 acres of cane in the raster,
 5,875 end up inside cane-labelled polygons. The rest is cane sitting in polygons that

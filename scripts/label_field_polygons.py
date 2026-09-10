@@ -76,19 +76,24 @@ SLIVER_SQM = 10.0
 #: off. Small enough that a field's usable edge does not move.
 DESPIKE_M = 4.0
 
-#: A polygon that would lose more than this fraction to despiking is not a field with
-#: a tail, it is a genuinely narrow shape, and it is left alone for the other gates to
-#: judge rather than mangled here.
-DESPIKE_KEEP = 0.90
+#: Smallest a polygon may be once its tails are off. Below this there was never a
+#: field there, only the tail.
+MIN_BODY_ACRES = 0.05
+
+#: Polsby-Popper compactness below which a shape is a line rather than a field, applied
+#: to everything once the tails are off. Measured on the layer: real fields sit well
+#: above this and the squiggles sit at 0.02 to 0.09.
+MIN_COMPACTNESS_ANY = 0.10
 
 #: A field is not a ribbon. Anything that disappears when eroded by half this width
 #: is the strip left between two delineated fields, where the 10 m raster and the
 #: traced boundaries disagree, and it was never a field of its own.
 MIN_FIELD_WIDTH_M = 20.0
 
-#: How much of its own minimum rotated rectangle a field fills. A real field fills
-#: most of it; an L, a hook or a staircase does not.
-MIN_RECTANGULARITY = 0.55
+#: How much of its own minimum rotated rectangle a field fills. An L, a hook or a
+#: staircase fills little of it. The floor sits below 0.5 on purpose: a triangular
+#: field fills exactly half its rectangle, and triangular fields are real.
+MIN_RECTANGULARITY = 0.45
 
 #: Polsby-Popper compactness, 4*pi*area / perimeter^2. A circle is 1 and a square is
 #: 0.79, so this only rejects shapes carrying far more edge than a field has.
@@ -400,9 +405,24 @@ def despike(geoms):
     core = geoms.buffer(-radius)
     body = core.buffer(radius * 1.25)
     cleaned = geoms.intersection(body)
-    keep = (~core.is_empty) & cleaned.is_valid & (cleaned.area >= DESPIKE_KEEP * geoms.area)
-    log.info("despiked %d of %d polygons", int(keep.sum()), len(geoms))
-    return geoms.where(~keep, cleaned)
+
+    # There is no "leave this one alone if it loses too much" clause any more, and that
+    # was the mistake in the first version. The polygons that lose most to despiking are
+    # precisely the ones that are mostly tail: one was 3.95 acres with a compactness of
+    # 0.021 and a solid body under it, and the guard protected it from being fixed.
+    #
+    # A polygon that vanishes entirely was a line, not a field. It comes back empty and
+    # is dropped by the caller, which is what should happen to the 1,081 squiggles in
+    # the traced layer that do not survive a four-metre erosion.
+    result = geoms.copy()
+    usable = cleaned.is_valid & ~cleaned.is_empty
+    result[usable] = cleaned[usable]
+    result[core.is_empty] = None
+
+    changed = int((usable & (cleaned.area < geoms.area * 0.999)).sum())
+    log.info("despiked %d polygons, dropped %d with no body at all",
+             changed, int(core.is_empty.sum()))
+    return result
 
 
 def field_like(geom, min_width: float = MIN_FIELD_WIDTH_M) -> bool:
@@ -549,7 +569,19 @@ def tidy(frame, out_crs=4326):
     # Tails come off first, while the coordinates are still in metres.
     frame = frame.copy()
     frame["geometry"] = despike(frame.geometry)
+    frame = frame[frame.geometry.notna()]
     frame = _polygons(frame)
+
+    # Now that every polygon has lost its tails, the ones still shaped like a line were
+    # always a line. Applied to traced polygons too: the delineation owns the geometry,
+    # but a squiggle two metres wide and forty long is not geometry anybody drew on
+    # purpose, and it is not a field a client can be handed.
+    compactness = 4 * np.pi * frame.area / (frame.length ** 2)
+    body = frame.area >= MIN_BODY_ACRES * SQM_PER_ACRE
+    shaped = compactness >= MIN_COMPACTNESS_ANY
+    log.info("after despiking: dropped %d as lines, %d as too small to be a body",
+             int((~shaped).sum()), int(shaped.sum() - (shaped & body).sum()))
+    frame = frame[shaped & body].reset_index(drop=True)
 
     # Validate, then snap to a grid finer than a centimetre. Reprojection leaves
     # coordinates that differ in the last digit where two polygons share an edge, and
