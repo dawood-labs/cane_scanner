@@ -724,6 +724,10 @@ def tidy(frame, out_crs=4326):
     import geopandas as gpd
     from shapely.validation import make_valid
 
+    if frame.empty:
+        log.info("tidy: nothing to tidy, this tile holds no polygons")
+        return frame
+
     # Tails come off first, while the coordinates are still in metres.
     frame = frame.copy()
     frame["geometry"] = despike(frame.geometry)
@@ -829,6 +833,16 @@ def main() -> None:
     everything = gpd.GeoDataFrame(
         pd.concat([labelled, orphans], ignore_index=True), crs=labelled.crs)
     everything = tidy(everything)
+    if everything.empty:
+        # A tile can hold crop and no delineation over it at all. That is a real answer,
+        # not a failure, and the caller has to be able to read it and move on.
+        log.info("no polygons here; writing empty layers so the caller can carry on")
+        OUT.mkdir(parents=True, exist_ok=True)
+        blank = everything.assign(acres=None, is_crop=None)
+        for name in ("fields_labelled", "fields_cane"):
+            blank.to_parquet(OUT / f"{name}.parquet")
+        print(f"\n0 polygons\n\noutputs -> {OUT}")
+        return
     everything["acres"] = everything.to_crs(UTM).area / SQM_PER_ACRE
     everything["is_crop"] = everything.crop_fraction >= args.threshold
 

@@ -59,9 +59,11 @@ MIN_ACRES = 0.15        #: and the same floor on the delivered polygons
 
 #: Tiles laboured on at once. This is a memory budget, not a core count: a tile holds
 #: its whole slice of the delineation, and they vary from about 1.7 to 2.5 GB depending
-#: on how many polygons fall inside. On the 7.5 GB machine two already reached 5,043 MB
-#: and the watchdog stopped the run; with WSL raised to 12 GB, four fit comfortably.
-LABEL_JOBS = 4
+#: on how many polygons fall inside. Four was set from a peak reading of 5,043 MB taken
+#: on the old 7.5 GB machine and was far too cautious: measured while running, four
+#: tiles hold about 3 GB between them, some 800 MB each, on twelve cores with 6 GB idle.
+#: Eight uses the machine and still leaves room for the spikes the dense tiles produce.
+LABEL_JOBS = 8
 UTM = 32642
 SQM_PER_ACRE = 4046.8564224
 EXPORT_SCALE, TILE_DEG = 10, 0.1
@@ -247,7 +249,7 @@ def stage_label(maps: Dict[str, Path]) -> None:
     for (folder, _), key in zip(LAYERS, ["timeseries", "10Aug", "30Aug", "09Sep",
                                          "union", "majority"]):
         target = OUT / "outputs" / folder
-        if (target / "fields_cane.gpkg").exists():
+        if (target / "fields_cane.parquet").exists():
             log.info("%s already labelled", folder)
             continue
         with Timed(f"label {folder}"):
@@ -258,8 +260,29 @@ def stage_label(maps: Dict[str, Path]) -> None:
             subprocess.run(
                 [sys.executable, str(SCRIPTS_DIR / "label_field_polygons_tiled.py"),
                  "--crop-map", str(maps[key]), "--out", str(target),
-                 "--min-acres", str(MIN_ACRES), "--jobs", str(LABEL_JOBS)],
+                 "--min-acres", str(MIN_ACRES), "--jobs", str(LABEL_JOBS),
+                 "--no-gpkg"],
                 check=True)
+
+
+def stage_gpkg() -> None:
+    """Write the GeoPackages once, at the end.
+
+    GeoPackage is what opens everywhere and is what the client gets, but at this size it
+    costs about a minute a layer where Parquet costs seconds. Six layers paid that
+    during the loop; now they pay it once, here, after everything else is settled.
+    """
+    import geopandas as gpd
+
+    for folder, _ in LAYERS:
+        target = OUT / "outputs" / folder
+        for name in ("fields_labelled", "fields_cane"):
+            source = target / f"{name}.parquet"
+            written = target / f"{name}.gpkg"
+            if not source.exists() or written.exists():
+                continue
+            with Timed(f"gpkg {folder}/{name}"):
+                gpd.read_parquet(source).to_file(written, driver="GPKG")
 
 
 def stage_summary() -> None:
@@ -336,7 +359,8 @@ def stage_summary() -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--stage", default="timeseries",
-                        choices=["all", "timeseries", "sieve", "static", "fuse", "label", "summary"])
+                        choices=["all", "timeseries", "sieve", "static", "fuse", "label", "gpkg",
+                                 "summary"])
     parser.add_argument("--fetch-jobs", type=int, default=3,
                         help="parallel Sentinel fetches; each holds a tile's whole "
                              "time series, so this is a memory budget, not a core count")
@@ -346,7 +370,7 @@ def main() -> None:
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s", datefmt="%H:%M:%S")
 
-    stages = (["timeseries", "sieve", "static", "fuse", "label", "summary"]
+    stages = (["timeseries", "sieve", "static", "fuse", "label", "gpkg", "summary"]
               if args.stage == "all" else [args.stage])
     mask = OUT / f"rf_sieved_p{MIN_PIXELS}.tif"
 
@@ -370,6 +394,8 @@ def main() -> None:
             "union": OUT / f"fused_union_Cls_v4_p{MIN_PIXELS}.tif",
             "majority": OUT / f"fused_majority_Cls_v4_p{MIN_PIXELS}.tif",
         })
+    if "gpkg" in stages:
+        stage_gpkg()
     if "summary" in stages:
         stage_summary()
 

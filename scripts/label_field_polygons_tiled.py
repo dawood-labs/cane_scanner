@@ -137,6 +137,10 @@ def main() -> None:
                         help="tiles laboured on at once. Each is a separate process "
                              "holding one tile's delineation, so this is a memory "
                              "budget; three fits alongside the watchdog's ceiling.")
+    parser.add_argument("--no-gpkg", action="store_true",
+                        help="write GeoParquet only. GeoPackage takes a minute per "
+                             "layer at this size where Parquet takes seconds, so a run "
+                             "producing six layers writes them all at the end instead.")
     parser.add_argument("--min-acres", type=float, default=0.15)
     parser.add_argument("--threshold", type=float, default=0.5)
     parser.add_argument("--cache-dir", type=Path, default=None,
@@ -189,8 +193,9 @@ def main() -> None:
     crop_only = merged[merged.is_crop].copy()
     merged.to_parquet(args.out / "fields_labelled.parquet")
     crop_only.to_parquet(args.out / "fields_cane.parquet")
-    merged.to_file(args.out / "fields_labelled.gpkg", driver="GPKG")
-    crop_only.to_file(args.out / "fields_cane.gpkg", driver="GPKG")
+    if not args.no_gpkg:
+        merged.to_file(args.out / "fields_labelled.gpkg", driver="GPKG")
+        crop_only.to_file(args.out / "fields_cane.gpkg", driver="GPKG")
 
     # The per-tile pieces have served their purpose once the layer is merged and
     # written. The repair caches are not touched: those are shared between layers.
