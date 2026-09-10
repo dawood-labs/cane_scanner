@@ -794,6 +794,9 @@ def main() -> None:
                              "30 August v4 static sieve")
     parser.add_argument("--out", type=Path, default=None,
                         help="where the layers are written")
+    parser.add_argument("--min-acres", type=float, default=None,
+                        help="drop every output polygon smaller than this, applied last "
+                             "of all so nothing below the floor reaches the client")
     args = parser.parse_args()
 
     global CROP_MAP, OUT
@@ -828,6 +831,16 @@ def main() -> None:
     everything = tidy(everything)
     everything["acres"] = everything.to_crs(UTM).area / SQM_PER_ACRE
     everything["is_crop"] = everything.crop_fraction >= args.threshold
+
+    if args.min_acres:
+        # Applied last, after every repair, cut and trim has settled, because a polygon
+        # can end up under the floor through any of them. Multipart geometry is already
+        # impossible here: the tidy pass explodes and keeps only single Polygons.
+        small = everything.acres < args.min_acres
+        log.info("dropping %d polygons under %.2f acres (%.0f acres, %.0f of it crop)",
+                 int(small.sum()), args.min_acres, everything.acres[small].sum(),
+                 everything.loc[small & everything.is_crop, "acres"].sum())
+        everything = everything[~small].reset_index(drop=True)
 
     crop_only = everything[everything.is_crop].copy()
 
