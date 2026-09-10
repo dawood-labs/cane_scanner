@@ -95,10 +95,24 @@ MIN_BODY_ACRES = 0.05
 #: above this and the squiggles sit at 0.02 to 0.09.
 MIN_COMPACTNESS_ANY = 0.10
 
-#: A field is not a ribbon. Anything that disappears when eroded by half this width
-#: is the strip left between two delineated fields, where the 10 m raster and the
-#: traced boundaries disagree, and it was never a field of its own.
-MIN_FIELD_WIDTH_M = 20.0
+#: A field is not a ribbon. Anything that disappears when eroded by half this width is
+#: the strip left between two delineated fields, where the 10 m raster and the traced
+#: boundaries disagree, and it was never a field of its own.
+#:
+#: Measured against how much crop survives: 20 m keeps 700 acres of the unclaimed crop,
+#: 16 m keeps 809, 14 m keeps 822, 12 m keeps 831, and below that it falls again
+#: because the opening stops removing tails and the compactness gate takes the ragged
+#: shapes instead. The curve is flat past 14 m, and 14 is still comfortably wider than
+#: one Sentinel pixel, so a strip narrower than the sensor can resolve is still refused.
+MIN_FIELD_WIDTH_M = 14.0
+
+#: The same test applied to a piece a cut produced, where it has to be stricter. A
+#: block derived from the raster is ground nobody drew a boundary for and 14 m is a
+#: fair minimum. A split piece is carved out of a field somebody did draw, so a narrow
+#: one means the cut ran along an edge that was already there and shaved a needle off
+#: it. Tying the two together let 508 such cuts back in when the block floor was
+#: relaxed, which is exactly the shape that was reported from QGIS.
+MIN_SPLIT_WIDTH_M = 20.0
 
 #: How much of its own minimum rotated rectangle a field fills. An L, a hook or a
 #: staircase fills little of it. The floor sits below 0.5 on purpose: a triangular
@@ -368,6 +382,7 @@ def label(fields, crop, transform, shape):
     source_fid = (fields["fid"].to_numpy() if "fid" in fields.columns
                   else np.arange(1, len(fields) + 1))
     rows, geometries = [], []
+    holding: list = []          # non-crop polygons that still contain crop
     counts = {"clean": 0, "cut": 0, "majority": 0, "too_small": 0}
 
     positions = {}
@@ -406,6 +421,8 @@ def label(fields, crop, transform, shape):
 
         if fraction >= CROP_HIGH or fraction <= CROP_LOW:
             counts["clean"] += 1
+            if fraction <= CROP_LOW and truth.any():
+                holding.append(index)
             rows.append({"source_fid": int(source_fid[index]), "crop_fraction": fraction,
                          "origin": "delineation", "decision": "clean", "pixels": pixels})
             geometries.append(geom)
@@ -421,6 +438,8 @@ def label(fields, crop, transform, shape):
 
         if purity - baseline < MIN_CUT_GAIN:
             counts["majority"] += 1
+            if fraction < 0.5:
+                holding.append(index)
             rows.append({"source_fid": int(source_fid[index]), "crop_fraction": fraction,
                          "origin": "delineation", "decision": "mixed, majority label",
                          "pixels": pixels})
@@ -434,8 +453,10 @@ def label(fields, crop, transform, shape):
         # pieces of 11 pixels running the length of the parent, which is not something
         # that exists on the ground. If either side fails to look like a field, the cut
         # is abandoned and the polygon stays whole.
-        if not all(field_like(part) for part in (first, second)):
+        if not all(field_like(part, MIN_SPLIT_WIDTH_M) for part in (first, second)):
             counts["majority"] += 1
+            if fraction < 0.5:
+                holding.append(index)
             rows.append({"source_fid": int(source_fid[index]), "crop_fraction": fraction,
                          "origin": "delineation",
                          "decision": "mixed, cut would leave a sliver",
@@ -470,8 +491,9 @@ def label(fields, crop, transform, shape):
             geometries.append(geom)
 
     log.info("labelling: %s", counts)
+    log.info("non-crop polygons still holding crop: %d", len(holding))
     out = gpd.GeoDataFrame(rows, geometry=geometries, crs=fields.crs)
-    return out, ids, is_crop
+    return out, ids, is_crop, np.asarray(holding, dtype=np.int64)
 
 
 def despike(geoms):
@@ -585,13 +607,30 @@ def field_shaped(frame):
     return frame[keep].reset_index(drop=True)
 
 
-def orphan_polygons(is_crop, ids, transform, crs):
-    """Polygons for crop the delineation never covered, regularised so they read as fields."""
+def orphan_polygons(is_crop, ids, transform, crs, inside_ids=None):
+    """Polygons for crop no polygon is claiming, regularised so they read as fields.
+
+    Two cases, one code path. Crop with no polygon over it at all, and crop inside a
+    polygon that ended up labelled as something else: a 8.3-acre field carrying 2.1
+    acres of cane comes out at a crop fraction of 0.26, takes the majority label, and
+    the cane simply disappears. Across the layer that is 432 acres, 6% of the crop in
+    the raster.
+
+    Both are the same problem, ground the delineation has no boundary for, and both get
+    the same treatment: contiguous blocks, the shape test that rejects ribbons, and a
+    label saying where the geometry came from so nobody mistakes it for tracing.
+    """
     import geopandas as gpd
     from rasterio import features as rfeatures
     from shapely.geometry import shape as to_shape
 
     orphan = is_crop & (ids == 0)
+    inside = np.zeros_like(orphan)
+    if inside_ids is not None and inside_ids.size:
+        inside = is_crop & np.isin(ids, inside_ids + 1)
+        log.info("crop inside polygons labelled otherwise: %.0f acres",
+                 inside.sum() * PIXEL_SQM / SQM_PER_ACRE)
+    orphan = orphan | inside
     if not orphan.any():
         return gpd.GeoDataFrame(columns=["geometry"], geometry="geometry", crs=crs)
 
@@ -610,10 +649,24 @@ def orphan_polygons(is_crop, ids, transform, crs):
     frame["acres"] = frame.area / SQM_PER_ACRE
     log.info("orphan crop: %d polygons at or above %.2f acres, %.0f acres",
              len(frame), MIN_ORPHAN_ACRES, frame.acres.sum())
-    frame["source_fid"] = -1        # no traced polygon stood here
+    # Which of the two cases each block came from, so a reviewer can tell a block that
+    # had no polygon over it from one carved out of a polygon labelled otherwise.
+    from rasterio import features as rf2
+    claimed = rf2.rasterize(
+        ((geom, 1) for geom in gpd.GeoSeries(frame.geometry, crs=UTM).to_crs(4326)),
+        out_shape=inside.shape, transform=transform, fill=0, dtype="uint8") if inside.any() else None
+    centres = frame.to_crs(4326).geometry.representative_point()
+    rows, cols = zip(*[(~transform * (pt.x, pt.y))[::-1] for pt in centres])
+    rows = np.clip(np.asarray(rows, dtype=int), 0, inside.shape[0] - 1)
+    cols = np.clip(np.asarray(cols, dtype=int), 0, inside.shape[1] - 1)
+    from_inside = inside[rows, cols]
+
+    frame["source_fid"] = np.where(from_inside, ids[rows, cols], -1)
     frame["crop_fraction"] = 1.0
-    frame["origin"] = "derived from crop map"
-    frame["decision"] = "no delineation polygon here"
+    frame["origin"] = np.where(from_inside, "crop inside another polygon",
+                               "derived from crop map")
+    frame["decision"] = np.where(from_inside, "the polygon here is labelled otherwise",
+                                 "no delineation polygon here")
     return frame.drop(columns=["acres"])
 
 
@@ -699,7 +752,12 @@ def tidy(frame, out_crs=4326):
     # Rank: traced geometry ahead of derived whatever the sizes, then smaller ahead of
     # larger, exactly as in `repair`. Pushing the derived ones past every possible
     # traced area is what puts the two classes in that order with one number each.
-    rank = metric_area + derived * (metric_area.max() + 1.0)
+    span = metric_area.max() + 1.0
+    inside = (frame.origin == "crop inside another polygon").to_numpy()
+    # A block carved out of a polygon labelled otherwise has to win against that
+    # polygon, since the polygon is not claiming to be this crop. It is the one place
+    # besides an orphan where an edge comes from the raster, and it is labelled as such.
+    rank = metric_area + derived * span - inside * span
     geometries, _ = _resolve_overlaps(frame, priority=rank)
 
     frame["geometry"] = geometries
@@ -708,8 +766,9 @@ def tidy(frame, out_crs=4326):
     # A derived polygon that has been whittled below the orphan floor was never a
     # field, only the ragged edge of one the delineation already holds.
     metric_area = frame.to_crs(UTM).area.to_numpy()
-    small = (frame.origin == "derived from crop map").to_numpy() & (
-        metric_area < MIN_ORPHAN_ACRES * SQM_PER_ACRE)
+    raster_edged = frame.origin.isin(["derived from crop map",
+                                      "crop inside another polygon"]).to_numpy()
+    small = raster_edged & (metric_area < MIN_ORPHAN_ACRES * SQM_PER_ACRE)
     frame = frame[~small & (metric_area > SLIVER_SQM)].reset_index(drop=True)
     log.info("tidy: %d polygons, %.0f acres, %d invalid (checked in the output CRS)",
              len(frame), frame.to_crs(UTM).area.sum() / SQM_PER_ACRE,
@@ -730,7 +789,18 @@ def main() -> None:
                              "whole layer, which is slow and only informational")
     parser.add_argument("--no-gpkg", action="store_true",
                         help="write GeoParquet only, skipping the slower GeoPackage")
+    parser.add_argument("--crop-map", type=Path, default=None,
+                        help="the classification to label against; defaults to the "
+                             "30 August v4 static sieve")
+    parser.add_argument("--out", type=Path, default=None,
+                        help="where the layers are written")
     args = parser.parse_args()
+
+    global CROP_MAP, OUT
+    if args.crop_map:
+        CROP_MAP = args.crop_map
+    if args.out:
+        OUT = args.out
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s", datefmt="%H:%M:%S")
 
     import geopandas as gpd
@@ -743,12 +813,15 @@ def main() -> None:
     log.info("crop map: %.0f acres of class %d",
              (crop == CROP_CLASS).sum() * PIXEL_SQM / SQM_PER_ACRE, CROP_CLASS)
 
+    # The cache lives beside the delineation, not beside the output. It depends on the
+    # delineation alone, so tying it to an output folder means every new run location
+    # pays the repair cost again for the same answer.
     fields = load_repaired(DELINEATION, bounds, args.cache or
-                           OUT / f"{DELINEATION.stem}_repaired.parquet",
+                           DELINEATION.parent / f"{DELINEATION.stem}_repaired.parquet",
                            rebuild=args.rebuild_cache, report_coverage=args.coverage)
 
-    labelled, ids, is_crop = label(fields, crop, transform, shape)
-    orphans = orphan_polygons(is_crop, ids, transform, labelled.crs)
+    labelled, ids, is_crop, holding = label(fields, crop, transform, shape)
+    orphans = orphan_polygons(is_crop, ids, transform, labelled.crs, inside_ids=holding)
 
     everything = gpd.GeoDataFrame(
         pd.concat([labelled, orphans], ignore_index=True), crs=labelled.crs)
