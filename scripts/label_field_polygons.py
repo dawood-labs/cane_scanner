@@ -114,6 +114,9 @@ def repair(fields):
     log.info("after repair and explode: %d polygons (from %d); discarded %s",
              len(fields), before, dropped_types or "nothing")
 
+    fields = fields.copy()
+    if "fid" not in fields.columns:
+        fields["fid"] = np.arange(1, len(fields) + 1)
     metric = fields.to_crs(UTM)
     # What the layer actually covers, counting overlapped ground once. The plain sum
     # of polygon areas is larger than this, and the difference is the double-count
@@ -243,6 +246,8 @@ def label(fields, crop, transform, shape):
         ((geom, i) for i, geom in enumerate(wgs.geometry, start=1)),
         out_shape=shape, transform=transform, fill=0, dtype="int32")
 
+    source_fid = (fields["fid"].to_numpy() if "fid" in fields.columns
+                  else np.arange(1, len(fields) + 1))
     rows, geometries = [], []
     counts = {"clean": 0, "cut": 0, "majority": 0, "too_small": 0}
 
@@ -271,8 +276,9 @@ def label(fields, crop, transform, shape):
         pixels = members.size
         if pixels < MIN_PIXELS:
             counts["too_small"] += 1
-            rows.append({"crop_fraction": np.nan, "origin": "delineation",
-                         "decision": "too small to judge", "pixels": pixels})
+            rows.append({"source_fid": int(source_fid[index]), "crop_fraction": np.nan,
+                         "origin": "delineation", "decision": "too small to judge",
+                         "pixels": pixels})
             geometries.append(geom)
             continue
 
@@ -281,8 +287,8 @@ def label(fields, crop, transform, shape):
 
         if fraction >= CROP_HIGH or fraction <= CROP_LOW:
             counts["clean"] += 1
-            rows.append({"crop_fraction": fraction, "origin": "delineation",
-                         "decision": "clean", "pixels": pixels})
+            rows.append({"source_fid": int(source_fid[index]), "crop_fraction": fraction,
+                         "origin": "delineation", "decision": "clean", "pixels": pixels})
             geometries.append(geom)
             continue
 
@@ -296,8 +302,9 @@ def label(fields, crop, transform, shape):
 
         if purity - baseline < MIN_CUT_GAIN:
             counts["majority"] += 1
-            rows.append({"crop_fraction": fraction, "origin": "delineation",
-                         "decision": "mixed, majority label", "pixels": pixels})
+            rows.append({"source_fid": int(source_fid[index]), "crop_fraction": fraction,
+                         "origin": "delineation", "decision": "mixed, majority label",
+                         "pixels": pixels})
             geometries.append(geom)
             continue
 
@@ -313,7 +320,8 @@ def label(fields, crop, transform, shape):
             for piece in (part.geoms if part.geom_type == "MultiPolygon" else [part]):
                 if piece.area < 100.0:
                     continue
-                rows.append({"crop_fraction": float(side.mean()), "origin": "split",
+                rows.append({"source_fid": int(source_fid[index]),
+                             "crop_fraction": float(side.mean()), "origin": "split",
                              "decision": f"cut, purity {min(int(purity * 10) / 10, 0.9):.1f}+",
                              "pixels": int(side.size), "cut_purity": round(float(purity), 3)})
                 geometries.append(piece)
@@ -322,8 +330,9 @@ def label(fields, crop, transform, shape):
             counts["cut"] += 1
         else:
             counts["majority"] += 1
-            rows.append({"crop_fraction": fraction, "origin": "delineation",
-                         "decision": "mixed, cut failed", "pixels": pixels})
+            rows.append({"source_fid": int(source_fid[index]), "crop_fraction": fraction,
+                         "origin": "delineation", "decision": "mixed, cut failed",
+                         "pixels": pixels})
             geometries.append(geom)
 
     log.info("labelling: %s", counts)
@@ -354,10 +363,77 @@ def orphan_polygons(is_crop, ids, transform, crs):
     frame = frame[~frame.geometry.is_empty & frame.geometry.is_valid]
     log.info("orphan crop: %d polygons at or above %.2f acres, %.0f acres",
              len(frame), MIN_ORPHAN_ACRES, frame.acres.sum())
+    frame["source_fid"] = -1        # no traced polygon stood here
     frame["crop_fraction"] = 1.0
     frame["origin"] = "derived from crop map"
     frame["decision"] = "no delineation polygon here"
     return frame.drop(columns=["acres"])
+
+
+
+def tidy(frame):
+    """Final pass: valid geometry, no overlaps, and traced edges beating derived ones.
+
+    The overlap arithmetic in `repair` works on the input layer, but splitting and the
+    derived orphan polygons happen afterwards and reintroduce slivers: 12,934 pairs
+    sharing 40.8 acres between them, which is precision debris rather than real double
+    counting, plus about 1,250 polygons that come back invalid once reprojected.
+
+    Resolution order is the point. Traced geometry is placed first, smallest before
+    largest as in `repair`, and derived polygons are placed last, so a boundary the
+    crop map invented can never cut one that was drawn on the basemap. That is the
+    same rule as everywhere else here: the delineation owns the geometry.
+    """
+    import geopandas as gpd
+    from shapely.validation import make_valid
+
+    frame = frame.copy()
+    bad = ~frame.geometry.is_valid
+    if bad.any():
+        frame.loc[bad, "geometry"] = frame.loc[bad, "geometry"].apply(make_valid)
+    for _ in range(5):
+        frame = frame.explode(index_parts=False)
+        if not frame.geom_type.isin(["MultiPolygon", "GeometryCollection"]).any():
+            break
+    frame = frame[frame.geom_type == "Polygon"]
+    frame = frame[~frame.geometry.is_empty & frame.geometry.is_valid].reset_index(drop=True)
+
+    derived = (frame.origin == "derived from crop map").to_numpy()
+    areas = frame.area.to_numpy()
+    order = np.lexsort((areas, derived))          # traced first, then by size
+
+    index = frame.sindex
+    geometries = list(frame.geometry)
+    placed: set = set()
+    for position in order:
+        position = int(position)
+        geom = geometries[position]
+        if geom.is_empty:
+            continue
+        for other in index.query(geom, predicate="intersects"):
+            other = int(other)
+            if other == position or other not in placed or geometries[other].is_empty:
+                continue
+            geom = geom.difference(geometries[other])
+        geometries[position] = geom
+        placed.add(position)
+
+    frame["geometry"] = geometries
+    for _ in range(5):
+        frame = frame.explode(index_parts=False)
+        if not frame.geom_type.isin(["MultiPolygon", "GeometryCollection"]).any():
+            break
+    frame = frame[(frame.geom_type == "Polygon") & ~frame.geometry.is_empty]
+    frame = frame[frame.geometry.is_valid]
+
+    # A derived polygon that has been whittled below the orphan floor was never a
+    # field, only the ragged edge of one the delineation already holds.
+    small = (frame.origin == "derived from crop map") & (frame.area < MIN_ORPHAN_ACRES * SQM_PER_ACRE)
+    frame = frame[~small & (frame.area > SLIVER_SQM)].reset_index(drop=True)
+    log.info("tidy: %d polygons, %.0f acres, %d invalid",
+             len(frame), frame.area.sum() / SQM_PER_ACRE,
+             int((~frame.geometry.is_valid).sum()))
+    return frame
 
 
 def main() -> None:
@@ -385,6 +461,7 @@ def main() -> None:
 
     everything = gpd.GeoDataFrame(
         pd.concat([labelled, orphans], ignore_index=True), crs=labelled.crs)
+    everything = tidy(everything)
     everything["acres"] = everything.area / SQM_PER_ACRE
     everything["is_crop"] = everything.crop_fraction >= args.threshold
 
