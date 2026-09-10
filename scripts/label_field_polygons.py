@@ -76,6 +76,16 @@ SLIVER_SQM = 10.0
 #: off. Small enough that a field's usable edge does not move.
 DESPIKE_M = 4.0
 
+#: Bump this whenever `repair` changes. It is part of the cache key, so an old cached
+#: layer is rebuilt instead of silently keeping the old behaviour, which is the way
+#: caches usually go wrong.
+REPAIR_VERSION = 3
+
+#: Perimeter relative to that of a square of the same area. A square is 1.0 and a
+#: circle 0.89, so anything at or below this cannot be carrying a tail and is skipped
+#: rather than buffered, which halves the cost of despiking a layer.
+DESPIKE_SLENDERNESS = 1.15
+
 #: Smallest a polygon may be once its tails are off. Below this there was never a
 #: field there, only the tail.
 MIN_BODY_ACRES = 0.05
@@ -111,7 +121,101 @@ SIMPLIFY_M = 5.0
 
 # --------------------------------------------------------------------- geometry
 
-def repair(fields):
+def load_repaired(source, bounds, cache, rebuild: bool = False,
+                  report_coverage: bool = False):
+    """The repaired delineation, from cache when the cache is still valid.
+
+    Repairing costs about 270 of the 500 seconds a run takes, and it depends on nothing
+    but the delineation layer: not the crop map, not the date, not the model. A mill
+    gets processed again every time a new image lands, so this is the difference
+    between paying that cost once and paying it every time.
+
+    The cache key carries the source file's modification time, the window read, and a
+    version number bumped by hand whenever `repair` changes. Without the last of those
+    a cache quietly serves the old behaviour forever, which is how caches usually go
+    wrong.
+    """
+    import json
+    import geopandas as gpd
+
+    cache = Path(cache)
+    meta = cache.with_suffix(".json")
+    key = {"source": str(source),
+           "mtime": Path(source).stat().st_mtime,
+           "bounds": [round(float(b), 6) for b in bounds],
+           "version": REPAIR_VERSION}
+
+    if cache.exists() and meta.exists() and not rebuild:
+        try:
+            if json.loads(meta.read_text()) == key:
+                frame = gpd.read_parquet(cache)
+                log.info("repaired delineation from cache: %d polygons, %.0f acres",
+                         len(frame), frame.area.sum() / SQM_PER_ACRE)
+                return frame
+            log.info("cache is stale, repairing again")
+        except Exception as error:
+            log.info("cache unreadable (%s), repairing again", error)
+
+    fields = gpd.read_file(source, bbox=tuple(bounds), engine="pyogrio")
+    frame = repair(fields, report_coverage=report_coverage)
+    cache.parent.mkdir(parents=True, exist_ok=True)
+    frame.to_parquet(cache)
+    meta.write_text(json.dumps(key))
+    log.info("repaired delineation cached at %s", cache)
+    return frame
+
+
+def _resolve_overlaps(metric, priority=None):
+    """Give every overlapped patch of ground to whichever polygon has the better claim.
+
+    `priority` says what "better" means, lower winning. It defaults to area, so the
+    smaller polygon keeps its shape and the larger one is cut around it. `tidy` passes
+    something else: derived polygons rank behind traced ones whatever their size, so a
+    boundary the crop map invented can never cut one drawn on the basemap.
+
+    Done in two array operations rather than a loop. The first version walked the
+    polygons smallest-first and subtracted each already-placed neighbour one call at a
+    time, 36,000 iterations of it, and that single loop was 179 of the 500 seconds a
+    run took. Here every intersecting pair comes back from the index at once, the pairs
+    where the neighbour is the smaller claimant are kept, and each polygon is cut once
+    against the union of everything smaller that touches it.
+
+    It is not merely faster, it is slightly more correct. Walking in order meant a
+    polygon was cut against neighbours that had themselves already been trimmed, so
+    what it lost depended on the order things happened in. Cutting against the original
+    smaller geometry gives the same coverage and the same ownership with no such
+    dependence.
+    """
+    import shapely
+
+    if priority is None:
+        priority = metric.area.to_numpy()
+    priority = np.asarray(priority, dtype=float)
+    geoms = metric.geometry.to_numpy()
+    left, right = metric.sindex.query(metric.geometry, predicate="intersects")
+
+    # Keep a pair only where `right` has the better claim, so it keeps its shape and
+    # `left` is cut around it. Ties break on index so the relation stays antisymmetric
+    # and nothing cuts itself.
+    wins = ((priority[right] < priority[left])
+            | ((priority[right] == priority[left]) & (right < left)))
+    left, right = left[wins], right[wins]
+    if left.size == 0:
+        return geoms, 0
+
+    order = np.argsort(left, kind="stable")
+    left, right = left[order], right[order]
+    targets, starts = np.unique(left, return_index=True)
+    ends = np.append(starts[1:], left.size)
+
+    cutters = np.array([shapely.union_all(geoms[right[lo:hi]])
+                        for lo, hi in zip(starts, ends)], dtype=object)
+    out = geoms.copy()
+    out[targets] = shapely.difference(geoms[targets], cutters)
+    return out, int(targets.size)
+
+
+def repair(fields, report_coverage: bool = False):
     """Make every polygon valid, single-part, and disjoint from its neighbours.
 
     Half the delineation fails `is_valid` and 11,088 pairs overlap. Overlaps are the
@@ -151,35 +255,13 @@ def repair(fields):
     if "fid" not in fields.columns:
         fields["fid"] = np.arange(1, len(fields) + 1)
     metric = fields.to_crs(UTM)
-    # What the layer actually covers, counting overlapped ground once. The plain sum
-    # of polygon areas is larger than this, and the difference is the double-count
-    # that the client would otherwise be invoiced for.
-    union_acres = float(metric.geometry.union_all().area / SQM_PER_ACRE)
-    metric["area_m2"] = metric.area
-    order = np.argsort(metric.area_m2.to_numpy())  # smallest first: they keep their shape
+    # What the layer actually covers, counting overlapped ground once. Dissolving the
+    # whole layer is expensive and the answer only ever goes into a log line, so it is
+    # off unless asked for.
+    union_acres = (float(metric.geometry.union_all().area / SQM_PER_ACRE)
+                   if report_coverage else float("nan"))
 
-    index = metric.sindex
-    geometries = list(metric.geometry)
-    claimed: set = set()
-    trimmed = 0
-    for position in order:
-        position = int(position)
-        geom = geometries[position]
-        if geom.is_empty:
-            continue
-        neighbours = [int(i) for i in index.query(geom, predicate="intersects")
-                      if int(i) in claimed and int(i) != position]
-        for other in neighbours:
-            if geometries[other].is_empty:
-                continue
-            if geom.intersects(geometries[other]):
-                new = geom.difference(geometries[other])
-                if not new.equals(geom):
-                    trimmed += 1
-                geom = new
-        geometries[position] = geom
-        claimed.add(position)
-
+    geometries, trimmed = _resolve_overlaps(metric)
     metric["geometry"] = geometries
     metric = metric.explode(index_parts=False)
     metric = metric[(metric.geom_type == "Polygon") & ~metric.geometry.is_empty]
@@ -189,8 +271,12 @@ def repair(fields):
     log.info("overlap resolution trimmed %d polygons; dropped %d slivers holding %.1f acres",
              trimmed, int(dropped.sum()), float(metric.area[dropped].sum() / SQM_PER_ACRE))
     metric = metric[~dropped]
-    log.info("%d disjoint parts remain, %.0f acres (input covered %.0f acres of ground)",
-             len(metric), metric.area.sum() / SQM_PER_ACRE, union_acres)
+    if report_coverage:
+        log.info("%d disjoint parts remain, %.0f acres (input covered %.0f acres of ground)",
+                 len(metric), metric.area.sum() / SQM_PER_ACRE, union_acres)
+    else:
+        log.info("%d disjoint parts remain, %.0f acres",
+                 len(metric), metric.area.sum() / SQM_PER_ACRE)
     return metric.reset_index(drop=True)
 
 
@@ -402,9 +488,27 @@ def despike(geoms):
     much this way is genuinely narrow rather than tailed, and is left untouched.
     """
     radius = DESPIKE_M
-    core = geoms.buffer(-radius)
-    body = core.buffer(radius * 1.25)
-    cleaned = geoms.intersection(body)
+
+    # Buffering every polygon is the second most expensive thing here, and on a compact
+    # one it is a no-op. A tail adds perimeter without adding area, so the ratio of the
+    # perimeter to that of a square of the same area says which polygons can possibly
+    # have one. A square scores 1 and a circle 0.89; anything at or below the cut is
+    # left alone, which is exactly what despiking would have done to it anyway.
+    slender = geoms.length / (4.0 * np.sqrt(np.maximum(geoms.area, 1e-9)))
+    worth_it = (slender > DESPIKE_SLENDERNESS).to_numpy()
+
+    subset = geoms[worth_it]
+
+    # The buffering is done on a simplified copy and the result is intersected back
+    # with the original, so nothing about the output edges comes from the simplified
+    # version: it only decides which tails get found. Traced boundaries carry a great
+    # many vertices, and buffering all of them is most of the cost. One metre is far
+    # below the width of any tail worth cutting. quad_segs=1 for the same reason the
+    # rounding does not matter.
+    work = subset.simplify(1.0, preserve_topology=True)
+    core = work.buffer(-radius, resolution=1)
+    body = core.buffer(radius * 1.25, resolution=1)
+    cleaned = subset.intersection(body)
 
     # There is no "leave this one alone if it loses too much" clause any more, and that
     # was the mistake in the first version. The polygons that lose most to despiking are
@@ -416,12 +520,13 @@ def despike(geoms):
     # the traced layer that do not survive a four-metre erosion.
     result = geoms.copy()
     usable = cleaned.is_valid & ~cleaned.is_empty
-    result[usable] = cleaned[usable]
-    result[core.is_empty] = None
+    result[usable[usable].index] = cleaned[usable]
+    result[core.is_empty[core.is_empty].index] = None
 
-    changed = int((usable & (cleaned.area < geoms.area * 0.999)).sum())
-    log.info("despiked %d polygons, dropped %d with no body at all",
-             changed, int(core.is_empty.sum()))
+    log.info("despiked %d of %d polygons (%d skipped as already compact), "
+             "dropped %d with no body at all",
+             int(usable.sum()), len(geoms), int((~worth_it).sum()),
+             int(core.is_empty.sum()))
     return result
 
 
@@ -590,23 +695,12 @@ def tidy(frame, out_crs=4326):
 
     metric_area = frame.to_crs(UTM).area.to_numpy()
     derived = (frame.origin == "derived from crop map").to_numpy()
-    order = np.lexsort((metric_area, derived))    # traced first, then by size
 
-    index = frame.sindex
-    geometries = list(frame.geometry)
-    placed: set = set()
-    for position in order:
-        position = int(position)
-        geom = geometries[position]
-        if geom.is_empty:
-            continue
-        for other in index.query(geom, predicate="intersects"):
-            other = int(other)
-            if other == position or other not in placed or geometries[other].is_empty:
-                continue
-            geom = geom.difference(geometries[other])
-        geometries[position] = geom
-        placed.add(position)
+    # Rank: traced geometry ahead of derived whatever the sizes, then smaller ahead of
+    # larger, exactly as in `repair`. Pushing the derived ones past every possible
+    # traced area is what puts the two classes in that order with one number each.
+    rank = metric_area + derived * (metric_area.max() + 1.0)
+    geometries, _ = _resolve_overlaps(frame, priority=rank)
 
     frame["geometry"] = geometries
     frame = _snap(_polygons(frame))
@@ -627,6 +721,15 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--threshold", type=float, default=0.5,
                         help="crop fraction at which a polygon counts as crop")
+    parser.add_argument("--cache", type=Path, default=None,
+                        help="where the repaired delineation is cached")
+    parser.add_argument("--rebuild-cache", action="store_true",
+                        help="repair the delineation again even if the cache is valid")
+    parser.add_argument("--coverage", action="store_true",
+                        help="report the ground the input layer covers; dissolves the "
+                             "whole layer, which is slow and only informational")
+    parser.add_argument("--no-gpkg", action="store_true",
+                        help="write GeoParquet only, skipping the slower GeoPackage")
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s", datefmt="%H:%M:%S")
 
@@ -640,8 +743,9 @@ def main() -> None:
     log.info("crop map: %.0f acres of class %d",
              (crop == CROP_CLASS).sum() * PIXEL_SQM / SQM_PER_ACRE, CROP_CLASS)
 
-    fields = gpd.read_file(DELINEATION, bbox=tuple(bounds), engine="pyogrio")
-    fields = repair(fields)
+    fields = load_repaired(DELINEATION, bounds, args.cache or
+                           OUT / f"{DELINEATION.stem}_repaired.parquet",
+                           rebuild=args.rebuild_cache, report_coverage=args.coverage)
 
     labelled, ids, is_crop = label(fields, crop, transform, shape)
     orphans = orphan_polygons(is_crop, ids, transform, labelled.crs)
@@ -652,9 +756,17 @@ def main() -> None:
     everything["acres"] = everything.to_crs(UTM).area / SQM_PER_ACRE
     everything["is_crop"] = everything.crop_fraction >= args.threshold
 
-    everything.to_file(OUT / "fields_labelled.gpkg", driver="GPKG")
     crop_only = everything[everything.is_crop].copy()
-    crop_only.to_file(OUT / "fields_cane.gpkg", driver="GPKG")
+
+    # GeoParquet for anything downstream, because it writes in seconds where GeoPackage
+    # takes a minute. GeoPackage as well, because that is what opens everywhere: QGIS
+    # only reads Parquet when its GDAL was built with the driver, and on Windows that
+    # is not something to rely on.
+    everything.to_parquet(OUT / "fields_labelled.parquet")
+    crop_only.to_parquet(OUT / "fields_cane.parquet")
+    if not args.no_gpkg:
+        everything.to_file(OUT / "fields_labelled.gpkg", driver="GPKG")
+        crop_only.to_file(OUT / "fields_cane.gpkg", driver="GPKG")
 
     print("\n" + "=" * 74)
     print(f"{'origin':26s} {'polygons':>10s} {'acres':>12s} {'of which crop':>14s}")

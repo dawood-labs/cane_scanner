@@ -138,10 +138,54 @@ Every feature carries `origin` (delineation, split, or derived from crop map),
 `decision`, `crop_fraction` and `pixels`, so any polygon in the deliverable can be
 traced back to why it is there.
 
+## Speed
+
+A run over this AOI took 500 seconds and now takes 85, which matters because
+production is millions of acres rather than seven thousand.
+
+| stage | before | after |
+|---|---|---|
+| repairing the delineation | 273 s | 2 s |
+| labelling and cutting | 29 s | 30 s |
+| despiking | 134 s | 11 s |
+| final tidy | 35 s | 37 s |
+| writing the output | 66 s | 2 s |
+
+Three things did it, and the fourth did not.
+
+**The repair is cached.** It depends on the delineation layer alone, not on the crop
+map, the date or the model, and a mill is processed again every time an image lands.
+The cache key carries the source file's modification time, the window read, and
+`REPAIR_VERSION`, which is bumped by hand whenever `repair` changes: without that a
+cache serves the old behaviour forever, which is how caches usually go wrong.
+
+**Overlap resolution is two array operations.** It walked the polygons smallest-first
+and subtracted each already-placed neighbour one call at a time, 36,000 iterations.
+Now every intersecting pair comes back from the index at once and each polygon is cut
+once against the union of everything with a better claim. It is also slightly more
+correct: walking in order meant a polygon was cut against neighbours that had already
+been trimmed, so what it lost depended on the order things happened in.
+
+**Despiking buffers a simplified copy.** The result is intersected back with the
+original, so the simplification only decides which tails are found and never touches an
+output edge. Traced boundaries carry a great many vertices and buffering all of them
+was the whole cost.
+
+**What did not work:** vectorising the overlap pass inside `tidy` as well. It made no
+measurable difference, because the cost there is `make_valid`, exploding and snapping
+20,000 polygons rather than the loop. The change stayed because it makes both passes
+one function, but it earned none of the speedup.
+
+Output is GeoParquet plus GeoPackage. Parquet writes in two seconds where GeoPackage
+takes a minute; QGIS reads Parquet only when its GDAL was built with the driver, so the
+GeoPackage is what goes to a client. `--no-gpkg` skips it.
+
 ## Rerunning
 
     python3 audit_field_labelling.py       # measure before deciding
     python3 label_field_polygons.py        # produce the layers
+    python3 label_field_polygons.py --no-gpkg        # GeoParquet only, faster
+    python3 label_field_polygons.py --rebuild-cache  # after changing repair()
 
 `--threshold` sets the crop fraction at which a polygon counts as crop; it defaults to
 0.5, which given the 0.85/0.15 clean bands only affects the polygons a cut could not
