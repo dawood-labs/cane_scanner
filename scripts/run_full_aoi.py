@@ -158,13 +158,59 @@ def _acres(path: Path, value: int = CROP_CLASS) -> float:
         return float((src.read(1) == value).sum()) * 100.0 / SQM_PER_ACRE
 
 
+def clip_to_aoi(path: Path, out: Path) -> Path:
+    """Cut a raster down to the AOI polygon.
+
+    Tiles are square and an AOI is not. This one is 1,044 km2 inside a 4,988 km2 box, so
+    a tiled fetch always brings back ground the client did not ask for: the grid here
+    covers 1,499,922 acres against the AOI's 258,011, and 31.9% of the time-series map's
+    cane sat outside it.
+
+    The static stage never had this problem because `create_aligned_mask` intersects
+    with the AOI while building its mask. The time-series stage had no such step, so it
+    was both delivering ground outside the AOI and making every stage behind it work on
+    that ground. Clipping here fixes both at once, since everything downstream reads
+    this raster.
+    """
+    import geopandas as gpd
+    import rasterio
+    from rasterio import features as rfeatures
+
+    if out.exists():
+        log.info("already clipped: %s", out.name)
+        return out
+
+    aoi = gpd.read_file(AOI_SHP, engine="pyogrio").to_crs(4326)
+    with rasterio.open(path) as src:
+        band = src.read(1)
+        profile = src.profile.copy()
+        inside = rfeatures.rasterize(aoi.geometry, out_shape=(src.height, src.width),
+                                     transform=src.transform, fill=0,
+                                     default_value=1, dtype="uint8").astype(bool)
+    before = float((band == CROP_CLASS).sum()) * 100 / SQM_PER_ACRE
+    band[~inside] = NODATA
+    after = float((band == CROP_CLASS).sum()) * 100 / SQM_PER_ACRE
+    log.info("clipped to the AOI: %.0f acres of cane became %.0f, %.0f acres dropped "
+             "as outside", before, after, before - after)
+
+    profile.update(compress="lzw", tiled=True, bigtiff="YES")
+    with rasterio.open(out, "w", **profile) as dst:
+        dst.write(band, 1)
+        dst.set_band_description(1, "crop class, clipped to the AOI")
+    return out
+
+
 def stage_sieve() -> Path:
     """The time-series map at 0.15 acres instead of 0.5."""
     raw = OUT / f"{AOI_SHP.stem}_rf_classification_map.tif"
+    # Clip first, sieve second: sieving ground that is about to be thrown away is work
+    # for nothing, and a blob straddling the AOI edge should be judged on the part that
+    # is inside.
+    clipped = clip_to_aoi(raw, OUT / f"{AOI_SHP.stem}_rf_classification_map_aoi.tif")
     fine = OUT / f"rf_sieved_p{MIN_PIXELS}.tif"
-    _sieve(raw, fine)
-    log.info("time-series cane: %.0f acres raw, %.0f after a %d-pixel sieve",
-             _acres(raw), _acres(fine), MIN_PIXELS)
+    _sieve(clipped, fine)
+    log.info("time-series cane: %.0f acres raw, %.0f inside the AOI, %.0f after a "
+             "%d-pixel sieve", _acres(raw), _acres(clipped), _acres(fine), MIN_PIXELS)
     return fine
 
 
