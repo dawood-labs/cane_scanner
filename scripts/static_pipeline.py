@@ -304,9 +304,28 @@ def execute_static_pipeline(
     static_image_date = list(dates) if dates else None
     
     base_dir.mkdir(parents=True, exist_ok=True)
+
+    def _suffix(dates_list):
+        return "_and_".join(datetime.strptime(d, "%Y-%m-%d").strftime("%d_%b_%Y")
+                            for d in dates_list)
+
+    # Check the checkpoint before fetching, not after. The suffix that names the output
+    # folder is derived from the dates, and when the caller states them there is nothing
+    # to learn from the imagery first: re-running three dates that were already
+    # classified was downloading 24 tiles apiece, nine minutes, only to find the answer
+    # already on disk and throw the tiles away. When the dates are chosen rather than
+    # given, the fetch is what decides them and this cannot be known in advance.
+    if static_image_date:
+        expected_dir = base_dir / _suffix(static_image_date)
+        expected_out = expected_dir / f"static_mosaic_{_suffix(static_image_date)}_Cls.tif"
+        if expected_out.exists():
+            logger.info(f"[CHECKPOINT FOUND] {expected_out.name} already exists; "
+                        f"skipping the fetch entirely")
+            return expected_out
+
     staging_dir = base_dir / "staging_temp"
     staging_dir.mkdir(parents=True, exist_ok=True)
-    
+
     logger.info("Initiating STAC acquisition for optimal static composite into staging directory...")
     
     static_result = fetch_sentinel_static_imagery(
@@ -330,8 +349,7 @@ def execute_static_pipeline(
         logger.warning("No 'dates' key found. Defaulting to 'Unknown_Date'.")
         date_suffix = "Unknown_Date"
     else:
-        formatted_dates = [datetime.strptime(d, "%Y-%m-%d").strftime("%d_%b_%Y") for d in raw_dates]
-        date_suffix = "_and_".join(formatted_dates)
+        date_suffix = _suffix(raw_dates)
         
     final_out_dir = base_dir / date_suffix
     final_output_path = final_out_dir / f"static_mosaic_{date_suffix}_Cls.tif"

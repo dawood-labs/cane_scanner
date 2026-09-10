@@ -128,10 +128,16 @@ def classify_raster(
                     f"refusing to classify {Path(raster_path).name}: {verdict}"
                 )
 
-        label_profile = {**profile, "count": 1, "dtype": "uint8", "nodata": nodata_out,
-                         "compress": "lzw", "tiled": True}
-        prob_profile = {**profile, "count": 1, "dtype": "float32", "nodata": np.nan,
-                        "compress": "lzw", "tiled": True}
+        # The output driver is stated, not inherited. Copying the source profile is
+        # right for the grid and the CRS and wrong for the driver: reading a VRT, which
+        # is how any mosaic larger than a tile arrives, would make the output a VRT too,
+        # and a VRT band cannot be written. bigtiff because a mill AOI is 7,791 square.
+        written = {"driver": "GTiff", "compress": "lzw", "tiled": True,
+                   "blockxsize": 256, "blockysize": 256, "bigtiff": "YES"}
+        label_profile = {**profile, **written, "count": 1, "dtype": "uint8",
+                         "nodata": nodata_out}
+        prob_profile = {**profile, **written, "count": 1, "dtype": "float32",
+                        "nodata": np.nan}
 
         Path(out_label_path).parent.mkdir(parents=True, exist_ok=True)
         prob_writer = None

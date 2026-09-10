@@ -56,6 +56,12 @@ STATIC_DATES = [("10_Aug_2026", "2026-08-10"),
 CROP_CLASS, BACKGROUND, NODATA = 1, 4, 255
 MIN_PIXELS = 6          #: 0.15 acres at 10 m
 MIN_ACRES = 0.15        #: and the same floor on the delivered polygons
+
+#: Tiles laboured on at once. This is a memory budget, not a core count: a tile holds
+#: its whole slice of the delineation, and they vary from about 1.7 to 2.5 GB depending
+#: on how many polygons fall inside. On the 7.5 GB machine two already reached 5,043 MB
+#: and the watchdog stopped the run; with WSL raised to 12 GB, four fit comfortably.
+LABEL_JOBS = 4
 UTM = 32642
 SQM_PER_ACRE = 4046.8564224
 EXPORT_SCALE, TILE_DEG = 10, 0.1
@@ -198,6 +204,13 @@ def stage_fuse(classified: List[Path]) -> Dict[str, Path]:
     import numpy as np
     import rasterio
 
+    done = {name: OUT / f"fused_{name}_Cls_v4_p{MIN_PIXELS}.tif"
+            for name in ("union", "majority")}
+    if all(path.exists() for path in done.values()):
+        for name, path in done.items():
+            log.info("%s already fused: %.0f acres", name, _acres(path))
+        return done
+
     stack, profile = [], None
     for path in classified:
         with rasterio.open(path) as src:
@@ -238,10 +251,14 @@ def stage_label(maps: Dict[str, Path]) -> None:
             log.info("%s already labelled", folder)
             continue
         with Timed(f"label {folder}"):
+            # Tiled, not straight through: repairing 17,074 polygons peaked at 4 GB
+            # and the full delineation is 144,670, which would be thirty gigabytes on
+            # a seven gigabyte machine. Each tile runs in its own process, which is
+            # what actually returns the memory.
             subprocess.run(
-                [sys.executable, str(SCRIPTS_DIR / "label_field_polygons.py"),
+                [sys.executable, str(SCRIPTS_DIR / "label_field_polygons_tiled.py"),
                  "--crop-map", str(maps[key]), "--out", str(target),
-                 "--min-acres", str(MIN_ACRES)],
+                 "--min-acres", str(MIN_ACRES), "--jobs", str(LABEL_JOBS)],
                 check=True)
 
 

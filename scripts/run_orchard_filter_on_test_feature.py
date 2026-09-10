@@ -33,7 +33,11 @@ CROPSCAN = SCRIPTS_DIR.parent
 TEST = CROPSCAN / "data" / "test_data" / "almoiz_unit_1_test_feature_1"
 CANE = TEST / "cane_2026"
 RF_SIEVED = CANE / "almoiz_unit_1_test_feature_1_rf_classification_map_strict_sieve_multiclass_p20.tif"
-SERIES = CANE / "almoiz_unit_1_test_feature_1_smoothed_mosaic.tif"
+# The smoothed stack is a VRT over the per-tile chunks on anything larger than a test
+# feature, because materialising it is 9 GB. Either is read the same way.
+_SERIES_STEM = CANE / "almoiz_unit_1_test_feature_1_smoothed_mosaic"
+SERIES = next((_SERIES_STEM.with_suffix(ext) for ext in (".vrt", ".tif")
+               if _SERIES_STEM.with_suffix(ext).exists()), _SERIES_STEM.with_suffix(".tif"))
 FIELDS_DIR = CROPSCAN / "data" / "Al_Moiz_Unit_1_field_delineation_COMPLETE"
 MODEL = CROPSCAN / "model_files" / "orchard_detector.json"
 OUT_DIR = CANE / "orchard_filtered"

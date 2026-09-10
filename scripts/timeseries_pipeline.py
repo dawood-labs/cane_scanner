@@ -53,6 +53,48 @@ def release_os_memory() -> None:
     except OSError:
         pass
 
+def stack_as_vrt(input_paths: List[Path], output_path: Path) -> Path:
+    """Point a VRT at the per-tile chunks instead of merging them into one raster.
+
+    `mosaic_continuous_rasters` reads every input into one array and then holds that
+    same array while GTiff compresses it, so it peaks twice. For the smoothed NDVI stack
+    over a mill AOI that array is 7,791 x 7,791 x 36 bands of float32, about 8.7 GB, and
+    on a 7 GB machine it took the whole session down with it.
+
+    A VRT is a few kilobytes of XML naming the chunks and where they sit. GDAL and
+    rasterio open it exactly like a GeoTIFF and read it windowed, which is how the only
+    consumer, `orchard_filter.score_pixels`, reads it anyway. The chunks are written
+    block by block upstream, so the chain becomes streaming end to end and nothing ever
+    holds the whole AOI.
+
+    The chunks are the VRT's pixels, not a temporary: whatever cleans up afterwards has
+    to leave them alone.
+    """
+    from osgeo import gdal
+
+    output_path = Path(output_path).with_suffix(".vrt")
+    logger.info(f"Building a VRT over {len(input_paths)} chunks: {output_path.name}")
+    vrt = gdal.BuildVRT(str(output_path), [str(p) for p in input_paths],
+                        options=gdal.BuildVRTOptions(resampleAlg="nearest"))
+    if vrt is None:
+        raise RuntimeError(f"gdal.BuildVRT produced nothing for {output_path}")
+    # BuildVRT does not carry band descriptions across, and losing them has broken this
+    # pipeline before: a mosaic without them made the static stage report no indexes to
+    # read. The dates are the only thing naming which timestep a band is.
+    with rasterio.open(input_paths[0]) as first:
+        names = first.descriptions
+    for index, name in enumerate(names, start=1):
+        if name:
+            vrt.GetRasterBand(index).SetDescription(name)
+    vrt.FlushCache()
+    del vrt
+
+    with rasterio.open(output_path) as check:
+        logger.info(f"VRT: {check.width} x {check.height}, {check.count} bands, "
+                    f"{check.dtypes[0]}, first band {check.descriptions[0]}")
+    return output_path
+
+
 def mosaic_continuous_rasters(input_paths: List[Path], output_path: Path) -> None:
     logger.info(f"\nMosaicing {len(input_paths)} continuous rasters using rasterio merge...")
     src_files = [rasterio.open(fp) for fp in input_paths]
@@ -88,7 +130,8 @@ def mosaic_categorical_rasters(input_paths: List[Path], output_path: Path, band_
     src_files = [rasterio.open(fp) for fp in input_paths]
     try:
         template_src = src_files[0]
-        nodata_val = template_src.nodata or 255
+        # `or 255` would turn a legitimate nodata of 0 into 255.
+        nodata_val = 255 if template_src.nodata is None else template_src.nodata
             
         mosaic, out_trans = merge(src_files, res=template_src.res, nodata=nodata_val, method='first')
         
@@ -191,7 +234,34 @@ def execute_stac_inference_pipeline(
         rf_model.n_jobs = 1  
         
         processed_results = []
-        
+
+        # A tile whose chunks are already on disk is not inferred again. Losing a run
+        # part way through used to mean redoing every tile, and the parts that survive
+        # a kill are exactly the parts worth keeping: the chunks are written before the
+        # process moves on, so whatever is there is finished.
+        def _existing(tif_path):
+            stem = Path(tif_path).stem
+            done = {"pred": chunks_dir / f"{stem}_predicted.tif",
+                    "raw": chunks_dir / f"{stem}_raw.tif" if export_raw_mosaic else None,
+                    "smoothed": chunks_dir / f"{stem}_smoothed.tif" if export_smoothed_mosaic else None}
+            if not done["pred"].exists():
+                return None
+            for key in ("raw", "smoothed"):
+                if done[key] is not None and not done[key].exists():
+                    return None
+            return {k: (v if v is None else str(v)) for k, v in done.items()}
+
+        pending = []
+        for tif_path in raw_tifs:
+            found = _existing(tif_path)
+            if found is not None:
+                processed_results.append(found)
+            else:
+                pending.append(tif_path)
+        if processed_results:
+            logger.info(f"{len(processed_results)} tiles already inferred; "
+                        f"{len(pending)} left to do")
+
         with ProcessPoolExecutor(max_workers=usable_cores, max_tasks_per_child=1) as executor:
             futures = {
                 executor.submit(
@@ -199,7 +269,7 @@ def execute_stac_inference_pipeline(
                     inference_start_date, inference_end_date, lmbd, d, clip_bounds, 255,
                     export_raw_mosaic, export_smoothed_mosaic
                 ): tif_path
-                for tif_path in raw_tifs
+                for tif_path in pending
             }
             
             # Using strict sys.stdout and dynamic_ncols to prevent multi-line rendering
@@ -222,13 +292,13 @@ def execute_stac_inference_pipeline(
             
             if export_raw_mosaic:
                 raw_paths = [res["raw"] for res in processed_results if res["raw"] is not None]
-                if raw_paths: 
-                    mosaic_continuous_rasters(raw_paths, out_dir / f"{output_basename}_raw_mosaic.tif")
+                if raw_paths:
+                    stack_as_vrt(raw_paths, out_dir / f"{output_basename}_raw_mosaic.vrt")
                 
             if export_smoothed_mosaic:
                 smoothed_paths = [res["smoothed"] for res in processed_results if res["smoothed"] is not None]
-                if smoothed_paths: 
-                    mosaic_continuous_rasters(smoothed_paths, out_dir / f"{output_basename}_smoothed_mosaic.tif")
+                if smoothed_paths:
+                    stack_as_vrt(smoothed_paths, out_dir / f"{output_basename}_smoothed_mosaic.vrt")
             
             if delete_raw_tiles:
                 if final_class_path.exists():
@@ -238,8 +308,18 @@ def execute_stac_inference_pipeline(
                     logger.warning("--- SKIPPING RAW TILE CLEANUP: Final map was not produced. Tiles retained for debugging. ---")
 
         finally:
-            logger.info("--- CLEANING UP TEMPORARY CHUNKS ---")
-            shutil.rmtree(chunks_dir, ignore_errors=True)
+            # The smoothed and raw chunks are what the VRTs point at, so they are not
+            # temporary any more. Only the predicted chunks can go, and only once the
+            # categorical mosaic that absorbed them exists.
+            if final_class_path.exists():
+                removed = 0
+                for chunk in chunks_dir.glob("*_predicted.tif"):
+                    chunk.unlink(missing_ok=True)
+                    removed += 1
+                logger.info(f"--- CLEANED UP {removed} PREDICTED CHUNKS; "
+                            f"KEEPING THE STACKS THE VRTs READ ---")
+            else:
+                logger.warning("--- KEEPING ALL CHUNKS: the final map was not produced ---")
             release_os_memory()
             
     else:
