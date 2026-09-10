@@ -98,6 +98,23 @@ protected rather than masked:
 Rahim Yar Khan is the mango belt and comes back with almost a third of its orchard
 blocks carrying cane, which is the pattern the mill managers describe.
 
+## Verification
+
+Two questions, both answered before the mask was published.
+
+**Does the mask contain cane?** Overlaid against the whole 2025 national scan,
+district by district: **0 ha inside the mask of 758,699 ha of mapped cane**. That is
+by construction rather than by luck, since the scan's polygons are cut out of the mask
+geometry, but it confirms the carve does what it claims across every district.
+
+**Does it damage a clean AOI?** Al-Moiz Unit 1 has no orchards in it. No mask block
+overlaps the AOI at all and all 7,237 acres of cane survive untouched. The residual
+phenology filter, run behind the mask on the same AOI, finds 344 pixels clearing the
+perennial gate, 0.09% of the map, and removes nothing.
+
+Final layer: 80,643 polygons, 295,107 ha, published at
+`gs://farmdar_data_catalog/fao_cane_model_file/orchard_exclusion_mask/`.
+
 ## Where it sits in the pipeline
 
 1. time-series RandomForest produces the sieved cane map

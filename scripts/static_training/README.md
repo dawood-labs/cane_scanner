@@ -142,3 +142,16 @@ from a feature set that six-fold cross-validation shows to be a 0.013 loss.
 | `train.py` | fitting, threshold selection and the sidecar |
 | `domain_check.py` | refuses imagery outside the training distribution |
 | `inference.py` | classify a raster with the guard and the model's own threshold |
+| `phenology.py` | shape-of-the-year features from a smoothed NDVI stack |
+| `orchard_filter.py` | drops confidently perennial ground after the time-series model |
+| `orchard_mask.py` | applies the never-cane orchard mask, protects intercropped blocks |
+
+## Companion notes
+
+| Document | What it covers |
+|---|---|
+| `NOTEBOOK_INTEGRATION.md` | wiring the v4 model into the execution notebook |
+| `ORCHARD_FINDINGS.md` | why an optical orchard detector does not work |
+| `SENTINEL1_DESIGN.md` | the radar experiment, and why it is not deployed |
+| `ORCHARD_MASK.md` | the never-cane mask, and cane grown inside orchards |
+| `FIELD_LABELLING.md` | turning a 10 m crop map into clean field polygons |
