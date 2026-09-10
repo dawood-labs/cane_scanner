@@ -19,6 +19,7 @@ shared:
     inference     classify a raster with the guard and the model's own threshold
     phenology     shape-of-the-year features, for annual crop versus perennial
     orchard_filter  drops perennial fields from a crop map, after the time-series model
+    orchard_mask    applies the never-cane orchard mask and protects intercropped blocks
 """
 
 from . import (
@@ -28,6 +29,7 @@ from . import (
     features,
     inference,
     orchard_filter,
+    orchard_mask,
     phenology,
     stability,
     train,
@@ -41,6 +43,7 @@ __all__ = [
     "features",
     "inference",
     "orchard_filter",
+    "orchard_mask",
     "phenology",
     "stability",
     "train",

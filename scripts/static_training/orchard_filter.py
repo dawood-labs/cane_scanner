@@ -234,6 +234,7 @@ def filter_crop_map(
     background_class: int = 4,
     threshold: Optional[float] = None,
     min_patch_pixels: int = MIN_PATCH_PIXELS,
+    protect_polygons: Optional[Path | str] = None,
 ) -> FilterResult:
     """Remove confidently perennial ground from a crop classification raster.
 
@@ -241,6 +242,12 @@ def filter_crop_map(
     gives real fields, which is what the cane pipeline has over its mill AOIs.
     Without one, the unit is a patch of adjacent gate-passing pixels, sized like an
     orchard block rather than like the mapped polygon it sits inside.
+
+    `protect_polygons` names ground the filter may not touch. It exists for the mango
+    belt, where growers plant cane between the tree rows: that cane never goes bare
+    and never crashes at harvest, so every phenology rule here reads it as woody and
+    would delete a real field. Inside the protected layer the decision is left to the
+    models that read reflectance instead of shape.
     """
     import rasterio
 
@@ -264,6 +271,14 @@ def filter_crop_map(
     scores, gate_pass = score_pixels(series_path, shape, mask, model_path,
                                      feature_names, gate)
     gate_pass &= mask
+
+    if protect_polygons is not None:
+        from . import orchard_mask as om
+        protected = om.rasterize_layer(protect_polygons, transform, shape,
+                                       rasterio.open(crop_map_path).bounds)
+        held = int((gate_pass & protected).sum())
+        gate_pass &= ~protected
+        log.info("intercropping protection held back %d gate-passing pixels", held)
     log.info("pixels clearing the perennial gate: %d (%.2f%% of the crop map)",
              int(gate_pass.sum()), 100 * gate_pass.sum() / pixels_before)
 

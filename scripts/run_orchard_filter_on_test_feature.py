@@ -37,6 +37,11 @@ SERIES = CANE / "almoiz_unit_1_test_feature_1_smoothed_mosaic.tif"
 FIELDS_DIR = CROPSCAN / "data" / "Al_Moiz_Unit_1_field_delineation_COMPLETE"
 MODEL = CROPSCAN / "model_files" / "orchard_detector.json"
 OUT_DIR = CANE / "orchard_filtered"
+#: Orchard blocks the 2025 scan says carry cane. Growers in the mango belt plant
+#: between the tree rows, and that cane reads as woody to every phenology rule
+#: here, so the filter is not allowed to act inside them.
+PROTECT = (CROPSCAN / "data" / "orchard_exclusion_mask"
+           / "orchard_blocks_with_cane.gpkg")
 
 CROP_CLASS, BACKGROUND = 1, 4
 SQM_PER_ACRE = 4046.8564224
@@ -114,6 +119,7 @@ def main() -> None:
         crop_class=CROP_CLASS,
         background_class=BACKGROUND,
         threshold=args.threshold,
+        protect_polygons=PROTECT if PROTECT.exists() else None,
     )
 
     acres_before = result.pixels_before * 100 / SQM_PER_ACRE
