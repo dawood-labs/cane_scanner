@@ -71,6 +71,34 @@ MIN_ORPHAN_ACRES = 0.15
 #: small but real polygons on the first run.
 SLIVER_SQM = 10.0
 
+#: How wide a spur has to be to be believed. Anything narrower than twice this is a
+#: tail hanging off a field, an artefact of tracing rather than a boundary, and comes
+#: off. Small enough that a field's usable edge does not move.
+DESPIKE_M = 4.0
+
+#: A polygon that would lose more than this fraction to despiking is not a field with
+#: a tail, it is a genuinely narrow shape, and it is left alone for the other gates to
+#: judge rather than mangled here.
+DESPIKE_KEEP = 0.90
+
+#: A field is not a ribbon. Anything that disappears when eroded by half this width
+#: is the strip left between two delineated fields, where the 10 m raster and the
+#: traced boundaries disagree, and it was never a field of its own.
+MIN_FIELD_WIDTH_M = 20.0
+
+#: How much of its own minimum rotated rectangle a field fills. A real field fills
+#: most of it; an L, a hook or a staircase does not.
+MIN_RECTANGULARITY = 0.55
+
+#: Polsby-Popper compactness, 4*pi*area / perimeter^2. A circle is 1 and a square is
+#: 0.79, so this only rejects shapes carrying far more edge than a field has.
+MIN_COMPACTNESS = 0.18
+
+#: Coordinate grid for the written file, in degrees. About a centimetre, well under
+#: any real boundary uncertainty, and coarse enough that reprojection rounding cannot
+#: split a shared edge into overlapping slivers.
+GRID = 1e-7
+
 #: How far a derived polygon may be simplified, in metres. Half a pixel keeps the
 #: shape honest while taking the staircase off a rasterised edge.
 SIMPLIFY_M = 5.0
@@ -309,6 +337,21 @@ def label(fields, crop, transform, shape):
             continue
 
         first, second = _halves(geom, angle, offset)
+
+        # A cut that shaves a needle off the edge of a field has not found a boundary,
+        # it has found the boundary that was already there. Inspection turned up split
+        # pieces of 11 pixels running the length of the parent, which is not something
+        # that exists on the ground. If either side fails to look like a field, the cut
+        # is abandoned and the polygon stays whole.
+        if not all(field_like(part) for part in (first, second)):
+            counts["majority"] += 1
+            rows.append({"source_fid": int(source_fid[index]), "crop_fraction": fraction,
+                         "origin": "delineation",
+                         "decision": "mixed, cut would leave a sliver",
+                         "pixels": pixels})
+            geometries.append(geom)
+            continue
+
         made = False
         for part in (first, second):
             if part.is_empty or part.area < 100.0:
@@ -340,6 +383,83 @@ def label(fields, crop, transform, shape):
     return out, ids, is_crop
 
 
+def despike(geoms):
+    """Take the tails off polygons without moving the boundaries that matter.
+
+    The traced delineation carries thin spurs, whiskers a metre or two wide running
+    several metres out of an otherwise sensible field, and the overlap arithmetic adds
+    more. They are visible immediately in QGIS and they are not boundaries.
+
+    Eroding and dilating removes them but rounds every corner, which would be a worse
+    change than the one being fixed. So the opened body is dilated slightly past its
+    own radius and intersected back with the original, which restores the true edges
+    and corners exactly while leaving the tails outside. A polygon that would lose too
+    much this way is genuinely narrow rather than tailed, and is left untouched.
+    """
+    radius = DESPIKE_M
+    core = geoms.buffer(-radius)
+    body = core.buffer(radius * 1.25)
+    cleaned = geoms.intersection(body)
+    keep = (~core.is_empty) & cleaned.is_valid & (cleaned.area >= DESPIKE_KEEP * geoms.area)
+    log.info("despiked %d of %d polygons", int(keep.sum()), len(geoms))
+    return geoms.where(~keep, cleaned)
+
+
+def field_like(geom, min_width: float = MIN_FIELD_WIDTH_M) -> bool:
+    """Does this polygon still have a core once eroded by half a field's width?
+
+    The one test that catches every shape a field is not: a needle, a ribbon, the
+    shaving off the edge of a bigger polygon. All of them vanish under erosion while a
+    field, however irregular, keeps a core.
+    """
+    if geom.is_empty:
+        return False
+    core = geom.buffer(-min_width / 2.0)
+    return (not core.is_empty) and core.area > 0.0
+
+
+def field_shaped(frame):
+    """Keep only the derived blobs that could plausibly be a field.
+
+    Area alone is not enough, and inspection in QGIS is what showed it: the layer came
+    back full of L-shapes, hooks and long thin ribbons, most of them the strip of
+    disagreement between a traced boundary and the 10 m raster rather than any field.
+    They clear a 0.15-acre floor easily, because a ribbon can be long.
+
+    Three tests, in order. An opening, eroding by half a minimum field width and
+    dilating back, which is a repair rather than a rejection: it strips the tentacles
+    off a blob and keeps whatever solid core is left, so a real field with a ragged arm
+    survives as the field. Then the area floor again, applied to what is left. Then two
+    shape gates, how much of its own rotated rectangle the polygon fills and how much
+    perimeter it carries for its area, which reject what the opening could not.
+    """
+    import geopandas as gpd
+
+    radius = MIN_FIELD_WIDTH_M / 2.0
+    start = len(frame)
+    frame = frame.assign(geometry=frame.geometry.buffer(-radius).buffer(radius))
+    frame = frame[~frame.geometry.is_empty & frame.geometry.is_valid]
+    frame = frame.explode(index_parts=False)
+    frame = frame[frame.geom_type == "Polygon"].reset_index(drop=True)
+    after_open = len(frame)
+
+    frame = frame[frame.area >= MIN_ORPHAN_ACRES * SQM_PER_ACRE].reset_index(drop=True)
+    after_area = len(frame)
+    if frame.empty:
+        log.info("derived shapes: %d in, none survived the opening", start)
+        return frame
+
+    rectangle = frame.geometry.apply(lambda g: g.minimum_rotated_rectangle.area)
+    rectangularity = frame.area / rectangle.replace(0, np.nan)
+    compactness = 4 * np.pi * frame.area / (frame.length ** 2)
+    keep = (rectangularity >= MIN_RECTANGULARITY) & (compactness >= MIN_COMPACTNESS)
+
+    log.info("derived shapes: %d in, %d after opening, %d above the area floor, "
+             "%d field-shaped (%d rejected as ribbons or hooks)",
+             start, after_open, after_area, int(keep.sum()), int((~keep).sum()))
+    return frame[keep].reset_index(drop=True)
+
+
 def orphan_polygons(is_crop, ids, transform, crs):
     """Polygons for crop the delineation never covered, regularised so they read as fields."""
     import geopandas as gpd
@@ -354,13 +474,15 @@ def orphan_polygons(is_crop, ids, transform, crs):
     for geom, _ in rfeatures.shapes(orphan.astype(np.uint8), mask=orphan, transform=transform):
         records.append(to_shape(geom))
     frame = gpd.GeoDataFrame(geometry=records, crs=4326).to_crs(UTM)
-    frame["acres"] = frame.area / SQM_PER_ACRE
-    frame = frame[frame.acres >= MIN_ORPHAN_ACRES].reset_index(drop=True)
+    frame = field_shaped(frame)
+    if frame.empty:
+        return gpd.GeoDataFrame(columns=["geometry"], geometry="geometry", crs=crs)
 
     # A rasterised edge is a staircase. Simplifying at half a pixel takes the steps
     # off without moving the boundary anywhere a client would notice.
     frame["geometry"] = frame.geometry.simplify(SIMPLIFY_M, preserve_topology=True)
     frame = frame[~frame.geometry.is_empty & frame.geometry.is_valid]
+    frame["acres"] = frame.area / SQM_PER_ACRE
     log.info("orphan crop: %d polygons at or above %.2f acres, %.0f acres",
              len(frame), MIN_ORPHAN_ACRES, frame.acres.sum())
     frame["source_fid"] = -1        # no traced polygon stood here
@@ -371,8 +493,45 @@ def orphan_polygons(is_crop, ids, transform, crs):
 
 
 
-def tidy(frame):
+
+def _polygons(frame):
+    """Valid, single-part polygons, however nested or broken the input was."""
+    from shapely.validation import make_valid
+
+    for _ in range(4):
+        bad = ~frame.geometry.is_valid
+        if bad.any():
+            frame = frame.copy()
+            frame.loc[bad, "geometry"] = frame.loc[bad, "geometry"].apply(make_valid)
+        frame = frame.explode(index_parts=False)
+        if not frame.geom_type.isin(["MultiPolygon", "GeometryCollection"]).any():
+            break
+    frame = frame[frame.geom_type == "Polygon"]
+    return frame[~frame.geometry.is_empty & frame.geometry.is_valid].reset_index(drop=True)
+
+
+def _snap(frame):
+    """Round coordinates onto the output grid, then repair whatever that broke.
+
+    Snapping has to come after validation, not before: set_precision refuses an
+    invalid ring outright with a side-location conflict rather than fixing it.
+    """
+    from shapely import set_precision
+
+    frame = frame.copy()
+    frame["geometry"] = set_precision(frame.geometry.to_numpy(), GRID)
+    return _polygons(frame)
+
+
+def tidy(frame, out_crs=4326):
     """Final pass: valid geometry, no overlaps, and traced edges beating derived ones.
+
+    This runs in the CRS the file is written in, not in the metric CRS the work was
+    done in. Cleaning first and reprojecting afterwards looks equivalent and is not:
+    converting metres to degrees rounds coordinates, and the rounding reopens what was
+    just closed. Cleaned in UTM and written in WGS84, the deliverable came back with
+    592 self-intersecting polygons and 3,245 overlapping pairs holding 1.03 acres
+    between them, none of which existed before the reprojection.
 
     The overlap arithmetic in `repair` works on the input layer, but splitting and the
     derived orphan polygons happen afterwards and reintroduce slivers: 12,934 pairs
@@ -387,20 +546,19 @@ def tidy(frame):
     import geopandas as gpd
     from shapely.validation import make_valid
 
+    # Tails come off first, while the coordinates are still in metres.
     frame = frame.copy()
-    bad = ~frame.geometry.is_valid
-    if bad.any():
-        frame.loc[bad, "geometry"] = frame.loc[bad, "geometry"].apply(make_valid)
-    for _ in range(5):
-        frame = frame.explode(index_parts=False)
-        if not frame.geom_type.isin(["MultiPolygon", "GeometryCollection"]).any():
-            break
-    frame = frame[frame.geom_type == "Polygon"]
-    frame = frame[~frame.geometry.is_empty & frame.geometry.is_valid].reset_index(drop=True)
+    frame["geometry"] = despike(frame.geometry)
+    frame = _polygons(frame)
 
+    # Validate, then snap to a grid finer than a centimetre. Reprojection leaves
+    # coordinates that differ in the last digit where two polygons share an edge, and
+    # that is all it takes to turn a shared boundary into a sliver of overlap.
+    frame = _snap(_polygons(frame.to_crs(out_crs)))
+
+    metric_area = frame.to_crs(UTM).area.to_numpy()
     derived = (frame.origin == "derived from crop map").to_numpy()
-    areas = frame.area.to_numpy()
-    order = np.lexsort((areas, derived))          # traced first, then by size
+    order = np.lexsort((metric_area, derived))    # traced first, then by size
 
     index = frame.sindex
     geometries = list(frame.geometry)
@@ -419,19 +577,16 @@ def tidy(frame):
         placed.add(position)
 
     frame["geometry"] = geometries
-    for _ in range(5):
-        frame = frame.explode(index_parts=False)
-        if not frame.geom_type.isin(["MultiPolygon", "GeometryCollection"]).any():
-            break
-    frame = frame[(frame.geom_type == "Polygon") & ~frame.geometry.is_empty]
-    frame = frame[frame.geometry.is_valid]
+    frame = _snap(_polygons(frame))
 
     # A derived polygon that has been whittled below the orphan floor was never a
     # field, only the ragged edge of one the delineation already holds.
-    small = (frame.origin == "derived from crop map") & (frame.area < MIN_ORPHAN_ACRES * SQM_PER_ACRE)
-    frame = frame[~small & (frame.area > SLIVER_SQM)].reset_index(drop=True)
-    log.info("tidy: %d polygons, %.0f acres, %d invalid",
-             len(frame), frame.area.sum() / SQM_PER_ACRE,
+    metric_area = frame.to_crs(UTM).area.to_numpy()
+    small = (frame.origin == "derived from crop map").to_numpy() & (
+        metric_area < MIN_ORPHAN_ACRES * SQM_PER_ACRE)
+    frame = frame[~small & (metric_area > SLIVER_SQM)].reset_index(drop=True)
+    log.info("tidy: %d polygons, %.0f acres, %d invalid (checked in the output CRS)",
+             len(frame), frame.to_crs(UTM).area.sum() / SQM_PER_ACRE,
              int((~frame.geometry.is_valid).sum()))
     return frame
 
@@ -462,12 +617,12 @@ def main() -> None:
     everything = gpd.GeoDataFrame(
         pd.concat([labelled, orphans], ignore_index=True), crs=labelled.crs)
     everything = tidy(everything)
-    everything["acres"] = everything.area / SQM_PER_ACRE
+    everything["acres"] = everything.to_crs(UTM).area / SQM_PER_ACRE
     everything["is_crop"] = everything.crop_fraction >= args.threshold
 
-    everything.to_crs(4326).to_file(OUT / "fields_labelled.gpkg", driver="GPKG")
+    everything.to_file(OUT / "fields_labelled.gpkg", driver="GPKG")
     crop_only = everything[everything.is_crop].copy()
-    crop_only.to_crs(4326).to_file(OUT / "fields_cane.gpkg", driver="GPKG")
+    crop_only.to_file(OUT / "fields_cane.gpkg", driver="GPKG")
 
     print("\n" + "=" * 74)
     print(f"{'origin':26s} {'polygons':>10s} {'acres':>12s} {'of which crop':>14s}")

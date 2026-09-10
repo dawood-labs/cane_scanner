@@ -64,20 +64,54 @@ trimmed; the slivers that fell out hold 6.3 acres between them.
 fraction is not a measurement. They keep their geometry and are flagged rather than
 guessed at.
 
+## Shape, not just area
+
+Inspection in QGIS is what caught this, and nothing in the logs would have. The layer
+came back full of shapes that no field has: long thin ribbons, L-shapes, hooks, and
+whiskers a metre or two wide hanging several metres off otherwise sensible polygons.
+A 0.15-acre floor does not catch any of them, because a ribbon can be long.
+
+One test settles all three: **a shape that disappears when eroded by half a field's
+width was never a field.** It is applied three different ways, because the right
+remedy differs.
+
+**Derived polygons get an opening.** Eroded by 10 m and dilated back, which is a
+repair rather than a rejection: the tentacles come off and whatever solid core is left
+survives as the field. Then the area floor again, then two shape gates, how much of
+its own rotated rectangle the polygon fills and how much perimeter it carries for its
+area. Of 7,548 blobs of crop lying outside the delineation, 455 survive the opening,
+368 clear the area floor, and 354 are field-shaped. The 94% that vanish are the strip
+of disagreement between a traced boundary and a 10 m raster, which is itself evidence
+that the delineation is the better geometry.
+
+**Slivering cuts are abandoned rather than emitted.** A cut running nearly parallel to
+the parent's own edge shaves off a needle: one such piece was 11 pixels and ran the
+length of the field. If either side of a proposed cut fails to look like a field, the
+cut is not made and the polygon stays whole with a majority label, flagged `mixed, cut
+would leave a sliver`. 805 cuts were abandoned this way. Abandoning beats discarding,
+which would lose the ground altogether.
+
+**Tails are trimmed off everything.** Eroding by 4 m removes any spur narrower than
+8 m, but eroding and dilating rounds every corner, which would be a worse change than
+the one being fixed. So the opened body is dilated slightly past its own radius and
+intersected back with the original, restoring the true edges and corners while leaving
+the tails outside. A polygon that would lose more than 10% this way is genuinely
+narrow rather than tailed and is left untouched. 18,230 of 19,777 polygons were
+trimmed.
+
 ## What comes out
 
 | origin | polygons | acres | of which cane |
 |---|---|---|---|
-| delineation, untouched | 15,998 | 16,686 | 3,844 |
-| split from a mixed polygon | 4,235 | 3,006 | 1,742 |
-| derived from the crop map | 663 | 499 | 499 |
-| **total** | **20,896** | **20,191** | **6,084** |
+| delineation, untouched | 16,977 | 17,474 | 4,476 |
+| split from a mixed polygon | 2,641 | 2,116 | 1,175 |
+| derived from the crop map | 318 | 223 | 223 |
+| **total** | **19,936** | **19,813** | **5,875** |
 
-82% of the cut pieces reach 0.8 purity or better and 34% reach 0.9 or better. Of the
-7,237 acres of cane in the raster, 6,084 end up inside cane-labelled polygons. The
-missing 16% is cane sitting in polygons that are mostly something else and were
-labelled accordingly: it is the price of refusing to let a raster edge become an
-output edge, and it is visible per polygon in `crop_fraction` rather than hidden.
+No invalid geometry and no overlapping area. Of the 7,237 acres of cane in the raster,
+5,875 end up inside cane-labelled polygons. The rest is cane sitting in polygons that
+are mostly something else, plus the 167 acres that were only ever ribbons and needles:
+real in the raster, but with no shape worth handing to a client.
 
 ## Output
 
