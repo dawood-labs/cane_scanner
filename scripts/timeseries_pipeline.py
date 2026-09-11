@@ -53,6 +53,68 @@ def release_os_memory() -> None:
     except OSError:
         pass
 
+def burn_aoi_into_tiles(tiles, aoi_path, block: int = 2048) -> int:
+    """Zero every band outside the AOI, so the inference never works on that ground.
+
+    The fetch already drops tiles that miss the AOI entirely (`sentinel._build_tiles`),
+    so what is left is the overhang: the part of a 0.1-degree cell that sticks out past
+    the polygon. On the Al-Moiz mill that is 2,513 km2 processed for a 1,044 km2 AOI.
+
+    Zeroing is the right way to say "nothing here", not an invention: the raw tiles carry
+    no declared nodata and encode missing as 0 in every band, and the worker re-derives
+    validity from `nir + red > 0`. So a zeroed pixel arrives at the worker as NaN NDVI in
+    every timestep, which drops it out of both expensive steps for free -- the Whittaker
+    solve skips pixels missing in all bands, and `predict` is only called on what
+    survives. No change to the worker, no change to the profile.
+
+    What it does not save is the block read, the NDVI divide and the write. The gain is
+    the linear algebra and the model, which is most of the stage but not all of it.
+
+    Windowed, because a tile is 37 bands and holding one whole is pointless when the
+    mask is built per window anyway. A clipped tile is marked with a sidecar so a resumed
+    run does not clip what it already clipped -- clipping twice is harmless but reading
+    3 GB to discover that is not.
+    """
+    import geopandas as gpd
+    from rasterio.features import geometry_mask
+    from rasterio.windows import Window, transform as window_transform
+
+    aoi = gpd.read_file(aoi_path)
+    if aoi.empty:
+        raise ValueError(f"{aoi_path} holds no geometry to clip to")
+
+    done = 0
+    for path in tiles:
+        marker = Path(path).with_suffix(".aoiclip")
+        if marker.exists():
+            continue
+
+        with rasterio.open(path, "r+") as src:
+            shapes = aoi.to_crs(src.crs).geometry.values
+            kept = dropped = 0
+            for y in range(0, src.height, block):
+                for x in range(0, src.width, block):
+                    win = Window(x, y, min(block, src.width - x), min(block, src.height - y))
+                    inside = geometry_mask(
+                        shapes, out_shape=(int(win.height), int(win.width)),
+                        transform=window_transform(win, src.transform),
+                        invert=True, all_touched=True)
+                    if inside.all():
+                        kept += inside.size
+                        continue
+                    data = src.read(window=win)
+                    data[:, ~inside] = 0
+                    src.write(data, window=win)
+                    kept += int(inside.sum())
+                    dropped += int((~inside).sum())
+
+        marker.write_text(f"cleared {dropped} pixels outside the AOI, kept {kept}\n")
+        logger.info(f"  {Path(path).name}: {100 * dropped / max(kept + dropped, 1):.0f}% "
+                    f"of the tile lay outside the AOI")
+        done += 1
+    return done
+
+
 def stack_as_vrt(input_paths: List[Path], output_path: Path) -> Path:
     """Point a VRT at the per-tile chunks instead of merging them into one raster.
 
@@ -186,7 +248,7 @@ def execute_stac_inference_pipeline(
     export_index_mask: bool = False, delete_raw_tiles: bool = True,
     ndvi_start: str = "2025-11-24", ndvi_end: str = "2026-09-09",
     step_days: int = 8, res_m: int = 10, tile_deg: float = 0.1,
-    fetch_workers: int = 4,
+    fetch_workers: int = 4, clip_tiles_to_aoi: bool = True,
 ):
     # The notebook took these from cell-level globals. Named here instead so a script
     # cannot pick up a different window than the notebook did without saying so.
@@ -225,6 +287,12 @@ def execute_stac_inference_pipeline(
         raw_tifs = list(raw_tiles_dir.glob("sentinel_*m_tile_*.tif"))
         if not raw_tifs:
             raise FileNotFoundError("STAC acquisition failed to output tiles.")
+
+        if clip_tiles_to_aoi:
+            logger.info("--- CLIPPING TILES TO THE AOI ---")
+            clipped = burn_aoi_into_tiles(raw_tifs, input_shp_path)
+            logger.info(f"clipped {clipped} tile(s); {len(raw_tifs) - clipped} were "
+                        f"already done")
             
         logger.info(f"--- PHASE 2: DISTRIBUTED INFERENCE ({len(raw_tifs)} Grids) ---")
         total_cores = multiprocessing.cpu_count()
