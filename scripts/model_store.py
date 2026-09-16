@@ -37,13 +37,13 @@ log = logging.getLogger("model_store")
 #: local file name -> (gs:// URI, md5 hex)
 MODELS: Dict[str, tuple] = {
     "best_rf_classifier_v4.joblib": (
-        f"gs://{BUCKET}/fao_cane_model_file/v4/best_rf_classifier_v4.joblib",
+        f"gs://{BUCKET}/cropscan/cane/models/v4/best_rf_classifier_v4.joblib",
         "bd373168648fd605896ade30bf0b44aa"),
     "fao_cane_xgb_model_v4.json": (
-        f"gs://{BUCKET}/fao_cane_model_file/v4/fao_cane_xgb_model_v4.json",
+        f"gs://{BUCKET}/cropscan/cane/models/v4/fao_cane_xgb_model_v4.json",
         "7dae08eaaf0bee3598f9ee36ae2ad623"),
     "fao_cane_xgb_model_v4.sidecar.json": (
-        f"gs://{BUCKET}/fao_cane_model_file/v4/fao_cane_xgb_model_v4.sidecar.json",
+        f"gs://{BUCKET}/cropscan/cane/models/v4/fao_cane_xgb_model_v4.sidecar.json",
         "acd65fcdcd47d1f90ebc183dee4082f1"),
 }
 

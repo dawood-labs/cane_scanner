@@ -5,8 +5,8 @@ running anything: most of what is below was learned by breaking something.
 
 ## What this project is
 
-Sugarcane mapping for FAO mill AOIs in Pakistan (Farmdar), from Sentinel-2. For each
-mill AOI the client gets **six layers of cane field polygons**:
+Farmdar **CropScan** sugarcane mapping for sugar mill AOIs in Pakistan, from
+Sentinel-2. This is CropScan work, not FAO work. For each mill AOI the client gets **six layers of cane field polygons**:
 
 | folder | what it is |
 |---|---|
@@ -58,9 +58,9 @@ The code runs on a new AOI with no data from earlier AOIs. It needs:
 
    | model | GCS |
    |---|---|
-   | time-series RandomForest | `gs://farmdar_data_catalog/fao_cane_model_file/v4/best_rf_classifier_v4.joblib` |
-   | static XGBoost v4 | `gs://farmdar_data_catalog/fao_cane_model_file/v4/fao_cane_xgb_model_v4.json` |
-   | its sidecar (threshold, domain guard) | `gs://farmdar_data_catalog/fao_cane_model_file/v4/fao_cane_xgb_model_v4.sidecar.json` |
+   | time-series RandomForest | `gs://farmdar_data_catalog/cropscan/cane/models/v4/best_rf_classifier_v4.joblib` |
+   | static XGBoost v4 | `gs://farmdar_data_catalog/cropscan/cane/models/v4/fao_cane_xgb_model_v4.json` |
+   | its sidecar (threshold, domain guard) | `gs://farmdar_data_catalog/cropscan/cane/models/v4/fao_cane_xgb_model_v4.sidecar.json` |
 
    Credentials, first found wins: `--gcs-key PATH` (or `GCS_KEY`),
    `GOOGLE_APPLICATION_CREDENTIALS`, a git-ignored `scripts/gcs_data_downloader*.json`,
@@ -71,8 +71,9 @@ Rules for the models in GCS:
 - A new model goes in a **new version folder** (`v5/`) with its md5 added to `MODELS`
   in `model_store.py`. Never overwrite an object in `v4/`: old maps must stay
   reproducible, and the checksum would stop every run anyway.
-- `fao_cane_model_file/fao_cane_rf_model.joblib` and `fao_cane_xgb_model.json` at the
-  folder root are the **old** models that `cropstack` uses. Leave them alone.
+- CropScan models live under `cropscan/cane/models/`. `fao_cane_model_file/` in the
+  same bucket is **FAO work** (the old models `cropstack` uses); do not put CropScan
+  files there or touch what is in it.
 - The sidecar always travels with the static model. Without it inference silently falls
   back to threshold 0.5 and no domain guard; `ensure_model` downloads both together.
 
