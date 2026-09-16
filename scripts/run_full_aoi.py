@@ -324,7 +324,7 @@ def stage_label(maps: Dict[str, Path]) -> None:
 
     for folder, _ in layers():
         target = OUT / "outputs" / folder
-        if (target / "fields_cane.parquet").exists():
+        if (target / f"{folder}_cane.parquet").exists():
             log.info("%s already labelled", folder)
             continue
         with Timed(f"label {folder}"):
@@ -336,7 +336,7 @@ def stage_label(maps: Dict[str, Path]) -> None:
                 [sys.executable, str(SCRIPTS_DIR / "label_field_polygons_tiled.py"),
                  "--crop-map", str(maps[folder]), "--out", str(target),
                  "--min-acres", str(MIN_ACRES), "--jobs", str(LABEL_JOBS),
-                 "--tile-km", str(LABEL_TILE_KM),
+                 "--tile-km", str(LABEL_TILE_KM), "--name", folder,
                  "--delineation", str(DELINEATION), "--no-gpkg"],
                 check=True)
 
@@ -352,13 +352,17 @@ def stage_gpkg() -> None:
 
     for folder, _ in layers():
         target = OUT / "outputs" / folder
-        for name in ("fields_labelled", "fields_cane"):
-            source = target / f"{name}.parquet"
-            written = target / f"{name}.gpkg"
+        for kind in ("labelled", "cane"):
+            stem = f"{folder}_{kind}"
+            source = target / f"{stem}.parquet"
+            written = target / f"{stem}.gpkg"
             if not source.exists() or written.exists():
                 continue
-            with Timed(f"gpkg {folder}/{name}"):
-                gpd.read_parquet(source).to_file(written, driver="GPKG")
+            with Timed(f"gpkg {stem}"):
+                # The layer is named too, not just the file: QGIS shows the layer's
+                # name, so leaving it at the default would put six identically named
+                # layers in the panel however the files are called.
+                gpd.read_parquet(source).to_file(written, driver="GPKG", layer=stem)
 
 
 def _overlap_acres(geoms) -> float:
@@ -399,7 +403,7 @@ def stage_summary() -> None:
         raster = maps[folder]
         row = {"layer": folder, "what it is": what,
                "raster acres": round(_acres(raster)) if raster.exists() else None}
-        cane = OUT / "outputs" / folder / "fields_cane.parquet"
+        cane = OUT / "outputs" / folder / f"{folder}_cane.parquet"
         if cane.exists():
             frame = gpd.read_parquet(cane).to_crs(UTM)
             row["polygons"] = len(frame)

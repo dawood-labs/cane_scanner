@@ -143,6 +143,12 @@ def main() -> None:
                              "layer at this size where Parquet takes seconds, so a run "
                              "producing six layers writes them all at the end instead.")
     parser.add_argument("--delineation", type=Path, default=None)
+    parser.add_argument("--name", default="fields",
+                        help="stem for the delivered files and for the layer inside "
+                             "each GeoPackage. QGIS names a layer after the layer in "
+                             "the file, not the folder it sits in, so six runs writing "
+                             "fields_cane.gpkg open as six layers all called "
+                             "fields_cane. Pass the layer's own name instead.")
     parser.add_argument("--min-acres", type=float, default=0.15)
     parser.add_argument("--threshold", type=float, default=0.5)
     parser.add_argument("--cache-dir", type=Path, default=None,
@@ -196,11 +202,13 @@ def main() -> None:
     merged = merged[merged.acres >= args.min_acres].reset_index(drop=True)
 
     crop_only = merged[merged.is_crop].copy()
-    merged.to_parquet(args.out / "fields_labelled.parquet")
-    crop_only.to_parquet(args.out / "fields_cane.parquet")
+    merged.to_parquet(args.out / f"{args.name}_labelled.parquet")
+    crop_only.to_parquet(args.out / f"{args.name}_cane.parquet")
     if not args.no_gpkg:
-        merged.to_file(args.out / "fields_labelled.gpkg", driver="GPKG")
-        crop_only.to_file(args.out / "fields_cane.gpkg", driver="GPKG")
+        merged.to_file(args.out / f"{args.name}_labelled.gpkg", driver="GPKG",
+                       layer=f"{args.name}_labelled")
+        crop_only.to_file(args.out / f"{args.name}_cane.gpkg", driver="GPKG",
+                          layer=f"{args.name}_cane")
 
     # The per-tile pieces have served their purpose once the layer is merged and
     # written. The repair caches are not touched: those are shared between layers.

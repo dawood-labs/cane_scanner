@@ -123,6 +123,18 @@ MIN_RECTANGULARITY = 0.45
 #: 0.79, so this only rejects shapes carrying far more edge than a field has.
 MIN_COMPACTNESS = 0.18
 
+#: A blob the first opening could not make field-shaped gets one more chance before it
+#: is thrown away. The opening is sized to snap tentacles, half a field width, and the
+#: lace between traced fields is wider than a tentacle -- a farm track, a watercourse,
+#: a field path. So it survives, carries eight kilometres of boundary for forty acres,
+#: and fails compactness, taking the real field embedded in it down with it. Eroding by
+#: a whole field width instead breaks the lace at its necks and leaves the fields.
+RESCUE_RADII = (MIN_FIELD_WIDTH_M, MIN_FIELD_WIDTH_M * 1.5)
+
+#: Only blobs big enough to hold a field are worth a second pass. Anything smaller
+#: loses everything to a 14 m erosion anyway, so this only saves the work.
+MIN_RESCUE_ACRES = 1.0
+
 #: Coordinate grid for the written file, in degrees. About a centimetre, well under
 #: any real boundary uncertainty, and coarse enough that reprojection rounding cannot
 #: split a shared edge into overlapping slivers.
@@ -565,6 +577,57 @@ def field_like(geom, min_width: float = MIN_FIELD_WIDTH_M) -> bool:
     return (not core.is_empty) and core.area > 0.0
 
 
+def _shape_gates(geom) -> bool:
+    """The same two gates `field_shaped` applies, for one geometry at a time."""
+    rectangle = geom.minimum_rotated_rectangle.area
+    if rectangle <= 0 or geom.length <= 0:
+        return False
+    return (geom.area / rectangle >= MIN_RECTANGULARITY
+            and 4 * np.pi * geom.area / geom.length ** 2 >= MIN_COMPACTNESS)
+
+
+def _rescue(frame):
+    """Look for fields inside the blobs the first opening could not clean up.
+
+    Erode by a whole field width rather than half of one, which breaks the blob at
+    every neck narrower than two field widths, then grow each surviving core back and
+    clip it to the blob it came from. Cores are taken largest first and each one is cut
+    out of what is left, so two fields sharing a strip of lace cannot both claim it.
+
+    A blob is only ever made smaller here, never invented: everything returned is a
+    subset of ground the classifier already called crop.
+    """
+    import geopandas as gpd
+    import shapely
+
+    found = []
+    for geom in frame.geometry:
+        if geom.area < MIN_RESCUE_ACRES * SQM_PER_ACRE:
+            continue
+        for radius in RESCUE_RADII:
+            core = geom.buffer(-radius, resolution=2)
+            if core.is_empty:
+                break
+            parts = [p for p in shapely.get_parts(shapely.make_valid(core))
+                     if p.geom_type == "Polygon" and not p.is_empty]
+            parts.sort(key=lambda p: p.area, reverse=True)
+            kept, taken = [], None
+            for part in parts:
+                grown = shapely.intersection(part.buffer(radius, resolution=2), geom)
+                if taken is not None:
+                    grown = shapely.difference(grown, taken)
+                for piece in shapely.get_parts(shapely.make_valid(grown)):
+                    if (piece.geom_type == "Polygon"
+                            and piece.area >= MIN_ORPHAN_ACRES * SQM_PER_ACRE
+                            and _shape_gates(piece)):
+                        kept.append(piece)
+                        taken = piece if taken is None else shapely.union_all([taken, piece])
+            if kept:
+                found.extend(kept)
+                break
+    return gpd.GeoDataFrame(geometry=found, crs=frame.crs)
+
+
 def field_shaped(frame):
     """Keep only the derived blobs that could plausibly be a field.
 
@@ -601,10 +664,17 @@ def field_shaped(frame):
     compactness = 4 * np.pi * frame.area / (frame.length ** 2)
     keep = (rectangularity >= MIN_RECTANGULARITY) & (compactness >= MIN_COMPACTNESS)
 
+    passed = frame[keep].reset_index(drop=True)
+    rescued = _rescue(frame[~keep]) if (~keep).any() else passed.iloc[0:0]
     log.info("derived shapes: %d in, %d after opening, %d above the area floor, "
-             "%d field-shaped (%d rejected as ribbons or hooks)",
-             start, after_open, after_area, int(keep.sum()), int((~keep).sum()))
-    return frame[keep].reset_index(drop=True)
+             "%d field-shaped (%d rejected as ribbons or hooks, %d fields recovered "
+             "from them holding %.0f acres)",
+             start, after_open, after_area, int(keep.sum()), int((~keep).sum()),
+             len(rescued), rescued.area.sum() / SQM_PER_ACRE if len(rescued) else 0.0)
+    if len(rescued):
+        passed = gpd.GeoDataFrame(pd.concat([passed, rescued], ignore_index=True),
+                                  geometry="geometry", crs=frame.crs)
+    return passed.reset_index(drop=True)
 
 
 def orphan_polygons(is_crop, ids, transform, crs, inside_ids=None):
