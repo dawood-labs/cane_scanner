@@ -47,20 +47,37 @@ repository is public and the acreages are client results.
 
 ## What a fresh clone needs
 
-The code runs on a new AOI with no data from earlier AOIs. Three things are not in git
-and must be provided:
+The code runs on a new AOI with no data from earlier AOIs. It needs:
 
-| what | where the code looks |
-|---|---|
-| time-series RandomForest | `model_files/best_rf_classifier_v4.joblib` |
-| static XGBoost v4 **and its sidecar** | `model_files/fao_cane_xgb_model_v4.json`, `model_files/fao_cane_xgb_model_v4.sidecar.json` |
-| the new AOI shapefile and its field delineation shapefile | anywhere; passed with `--aoi` and `--delineation` |
+1. **The new AOI shapefile and its field delineation shapefile**, passed with `--aoi`
+   and `--delineation`. Always pass `--delineation`: the default points at an Al-Moiz
+   path that will not exist.
+2. **GCS read access to the models.** They are not in git (public repo, trained on
+   client labels). They live in the private bucket and are downloaded on first use by
+   `scripts/model_store.py` into `model_files/`, checksum-verified:
 
-The sidecar is not optional: without it inference falls back to threshold 0.5 and no
-domain guard, and still runs, so the mistake is silent. Always pass `--delineation`
-too; the default points at an Al-Moiz path that will not exist. Imagery comes from
-public STAC catalogues (Planetary Computer, Earth Search), so no cloud credentials are
-needed for this pipeline.
+   | model | GCS |
+   |---|---|
+   | time-series RandomForest | `gs://farmdar_data_catalog/fao_cane_model_file/v4/best_rf_classifier_v4.joblib` |
+   | static XGBoost v4 | `gs://farmdar_data_catalog/fao_cane_model_file/v4/fao_cane_xgb_model_v4.json` |
+   | its sidecar (threshold, domain guard) | `gs://farmdar_data_catalog/fao_cane_model_file/v4/fao_cane_xgb_model_v4.sidecar.json` |
+
+   Credentials, first found wins: `--gcs-key PATH` (or `GCS_KEY`),
+   `GOOGLE_APPLICATION_CREDENTIALS`, a git-ignored `scripts/gcs_data_downloader*.json`,
+   then `gcloud auth application-default login`. `python3 scripts/model_store.py`
+   fetches all three up front (the RF is 187 MB, about 80 s).
+
+Rules for the models in GCS:
+- A new model goes in a **new version folder** (`v5/`) with its md5 added to `MODELS`
+  in `model_store.py`. Never overwrite an object in `v4/`: old maps must stay
+  reproducible, and the checksum would stop every run anyway.
+- `fao_cane_model_file/fao_cane_rf_model.joblib` and `fao_cane_xgb_model.json` at the
+  folder root are the **old** models that `cropstack` uses. Leave them alone.
+- The sidecar always travels with the static model. Without it inference silently falls
+  back to threshold 0.5 and no domain guard; `ensure_model` downloads both together.
+
+Imagery comes from public STAC catalogues (Planetary Computer, Earth Search), so the
+GCS credentials are only for the models.
 
 ## Machine and memory
 

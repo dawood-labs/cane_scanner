@@ -50,8 +50,9 @@ outside the repository.
 ## Requirements
 
 Python 3.12 with `rasterio`, `geopandas`, `pyogrio`, `shapely`, `pyarrow`,
-`pandas`, `numpy`, `scipy`, `xgboost`, `scikit-learn`, `pystac-client` and
-`odc-stac`.
+`pandas`, `numpy`, `scipy`, `xgboost`, `scikit-learn`, `pystac-client`,
+`odc-stac` and `google-cloud-storage` (models are fetched from GCS by
+`scripts/model_store.py`).
 
 ## A note on memory
 

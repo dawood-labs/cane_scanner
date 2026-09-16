@@ -42,8 +42,10 @@ AOI_DIR = CROPSCAN / "data" / "Al-Moiz-Unit-1-SM-AOI-2025"
 AOI_SHP = AOI_DIR / "Al-Moiz-Unit-1-SM-AOI-2025.shp"
 OUT = AOI_DIR / "cane_2026"
 
+#: Downloaded from GCS on first use by model_store.py, which holds the URIs and checksums.
 RF_MODEL = CROPSCAN / "model_files" / "best_rf_classifier_v4.joblib"
 STATIC_MODEL = CROPSCAN / "model_files" / "fao_cane_xgb_model_v4.json"
+GCS_KEY = None
 
 #: The window the RandomForest was trained to read, and the inference window inside it.
 NDVI_START, NDVI_END = "2025-11-24", "2026-09-09"
@@ -106,9 +108,11 @@ def stage_timeseries(jobs: int, fetch_jobs: int) -> Path:
         log.info("time-series map already exists: %s", expected.name)
         return expected
 
+    from model_store import ensure_model
+
     produced = execute_stac_inference_pipeline(
         input_shp_path=str(AOI_SHP),
-        model_path=str(RF_MODEL),
+        model_path=str(ensure_model(RF_MODEL.name, GCS_KEY)),
         final_out_dir=str(OUT),
         output_basename=basename,
         inference_start_date=INFER_START,
@@ -246,14 +250,17 @@ def stage_sieve() -> Path:
 
 def stage_static(mask_path: Path, fetch_jobs: int = 3) -> List[Path]:
     """Fetch and classify each of the three dates inside the finer mask."""
+    from model_store import ensure_model
     from static_pipeline import execute_static_pipeline
 
+    # Fetches the sidecar with it: the threshold and the domain guard live there.
+    model = ensure_model(STATIC_MODEL.name, GCS_KEY)
     produced = []
     for folder, date in STATIC_DATES:
         with Timed(f"static {folder}"):
             result = execute_static_pipeline(
                 base_dir=OUT, mask_path=mask_path, input_shp_path=str(AOI_SHP),
-                model_file=str(STATIC_MODEL), delete_tiles=False, use_mask=True,
+                model_file=str(model), delete_tiles=False, use_mask=True,
                 mask_keep_values=[CROP_CLASS], target_class_in=CROP_CLASS,
                 target_class_out=CROP_CLASS, background_out=BACKGROUND,
                 static_start=date, static_end=date,
@@ -460,13 +467,17 @@ def main() -> None:
                         help="labelling tile size. What bounds peak memory is polygons "
                              "per tile, not tiles: RYK carries 2.2x Al-Moiz's polygons "
                              "per square kilometre, so its tiles have to be smaller")
+    parser.add_argument("--gcs-key", default=None,
+                        help="service-account key for downloading the models; see "
+                             "model_store.py for the other ways credentials are found")
     parser.add_argument("--static-dates", default=None,
                         help="comma-separated YYYY-MM-DD for the static images; "
                              "defaults to the Al-Moiz dates")
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s", datefmt="%H:%M:%S")
 
-    global AOI_SHP, OUT, TIMINGS, DELINEATION, STATIC_DATES, LABEL_JOBS, LABEL_TILE_KM
+    global AOI_SHP, OUT, TIMINGS, DELINEATION, STATIC_DATES, LABEL_JOBS, LABEL_TILE_KM, GCS_KEY
+    GCS_KEY = args.gcs_key
     LABEL_JOBS = args.label_jobs or LABEL_JOBS
     LABEL_TILE_KM = args.tile_km or LABEL_TILE_KM
     if args.static_dates:
