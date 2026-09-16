@@ -214,11 +214,13 @@ def main() -> None:
     # written. The repair caches are not touched: those are shared between layers.
     shutil.rmtree(scratch, ignore_errors=True)
 
+    from label_field_polygons import overlap_acres
+
     summed = crop_only.acres.sum()
-    union = crop_only.to_crs(UTM).geometry.union_all().area / SQM_PER_ACRE
     print(f"\n{len(merged):,} polygons, {merged.acres.sum():,.0f} acres")
     print(f"{len(crop_only):,} cane polygons, {summed:,.0f} acres")
-    print(f"double counted: {summed - union:.3f} acres")
+    print(f"double counted: "
+          f"{overlap_acres(crop_only.to_crs(UTM).geometry.to_numpy()):.3f} acres")
     print(f"\noutputs -> {args.out}")
 
 

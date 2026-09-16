@@ -365,32 +365,6 @@ def stage_gpkg() -> None:
                 gpd.read_parquet(source).to_file(written, driver="GPKG", layer=stem)
 
 
-def _overlap_acres(geoms) -> float:
-    """How much ground the polygons claim twice, without unioning them.
-
-    The question was never what the union is, it is whether any two polygons cover the
-    same ground. An STRtree answers that directly: it returns the candidate pairs in C,
-    and only those pairs are intersected. Neighbours sharing an edge come back as
-    candidates and fall out on their own, because a shared edge has no area.
-    `union_all` on 140,000 polygons noded every edge in the layer to answer the same
-    question and took a quarter of an hour a layer; this takes seconds.
-
-    Ground covered by three polygons is counted once per pair, so the figure is an
-    upper bound -- which is the safe direction for a number that exists to decide
-    whether the acreage is billable as it stands.
-    """
-    import shapely
-
-    tree = shapely.STRtree(geoms)
-    left, right = tree.query(geoms, predicate="intersects")
-    keep = left < right          # each pair once, and never a polygon against itself
-    left, right = left[keep], right[keep]
-    if len(left) == 0:
-        return 0.0
-    area = shapely.area(shapely.intersection(geoms[left], geoms[right]))
-    return float(area.sum()) / SQM_PER_ACRE
-
-
 def stage_summary() -> None:
     """One table per question: what each map holds, and what each layer delivers."""
     import geopandas as gpd
@@ -412,7 +386,10 @@ def stage_summary() -> None:
                                if raster.exists() and _acres(raster) else None)
             # The number that decides whether dissolve is needed: if the polygons
             # overlap, a client adding up the acreage is billed for ground twice.
-            row["double counted"] = round(_overlap_acres(frame.geometry.to_numpy()), 3)
+            # One definition, in the module that owns the geometry rules.
+            from label_field_polygons import overlap_acres
+
+            row["double counted"] = round(overlap_acres(frame.geometry.to_numpy()), 3)
         rows.append(row)
 
     table = pd.DataFrame(rows)
