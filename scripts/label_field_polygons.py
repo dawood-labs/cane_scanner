@@ -798,12 +798,16 @@ def main() -> None:
                              "30 August v4 static sieve")
     parser.add_argument("--out", type=Path, default=None,
                         help="where the layers are written")
+    parser.add_argument("--delineation", type=Path, default=None,
+                        help="the traced field layer to label; defaults to Al-Moiz")
     parser.add_argument("--min-acres", type=float, default=None,
                         help="drop every output polygon smaller than this, applied last "
                              "of all so nothing below the floor reaches the client")
     args = parser.parse_args()
 
-    global CROP_MAP, OUT
+    global CROP_MAP, OUT, DELINEATION
+    if args.delineation:
+        DELINEATION = args.delineation
     if args.crop_map:
         CROP_MAP = args.crop_map
     if args.out:

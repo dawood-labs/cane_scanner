@@ -2,6 +2,7 @@
 # They are large, and most of them are client data.
 data/
 model_files/
+RYK_data/
 *.tif
 *.tiff
 *.vrt

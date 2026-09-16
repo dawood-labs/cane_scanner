@@ -28,6 +28,7 @@ import logging
 import os
 import sys
 import time
+from datetime import datetime
 from pathlib import Path
 from typing import Dict, List
 
@@ -64,6 +65,7 @@ MIN_ACRES = 0.15        #: and the same floor on the delivered polygons
 #: tiles hold about 3 GB between them, some 800 MB each, on twelve cores with 6 GB idle.
 #: Eight uses the machine and still leaves room for the spikes the dense tiles produce.
 LABEL_JOBS = 8
+LABEL_TILE_KM = 12.0
 UTM = 32642
 SQM_PER_ACRE = 4046.8564224
 EXPORT_SCALE, TILE_DEG = 10, 0.1
@@ -128,12 +130,40 @@ def stage_timeseries(jobs: int, fetch_jobs: int) -> Path:
 
 
 
-LAYERS = [("01_timeseries", "the time-series model alone"),
-          ("02_static_10Aug", "static v4 on 10 August"),
-          ("03_static_30Aug", "static v4 on 30 August"),
-          ("04_static_09Sep", "static v4 on 9 September"),
-          ("05_fused_union", "cane where any date says cane"),
-          ("06_fused_majority", "cane where two of the three dates agree")]
+def _short(folder: str) -> str:
+    """"10_Aug_2026" -> "10Aug", the form the output folders use."""
+    return "".join(folder.split("_")[:2])
+
+
+def _pretty(date: str) -> str:
+    """"2026-08-10" -> "10 August"."""
+    return datetime.strptime(date, "%Y-%m-%d").strftime("%d %B").lstrip("0")
+
+
+def layers():
+    """(folder, what it is) for every delivered layer, derived from STATIC_DATES.
+
+    Built rather than written down, because the dates are chosen per AOI: RYK's
+    windows land on different days than Al-Moiz's, and the folder names, the summary
+    rows and the labelling keys all have to follow them.
+    """
+    out = [("01_timeseries", "the time-series model alone")]
+    for i, (folder, date) in enumerate(STATIC_DATES, start=2):
+        out.append((f"{i:02d}_static_{_short(folder)}", f"static v4 on {_pretty(date)}"))
+    n = len(out)
+    need = len(STATIC_DATES) // 2 + 1
+    out.append((f"{n + 1:02d}_fused_union", "cane where any date says cane"))
+    out.append((f"{n + 2:02d}_fused_majority",
+                f"cane where {need} of the {len(STATIC_DATES)} dates agree"))
+    return out
+
+
+def layer_maps():
+    """folder -> the classification raster whose labels that folder's polygons carry."""
+    paths = [OUT / f"rf_sieved_p{MIN_PIXELS}.tif"]
+    paths += [OUT / f"static_{f}_Cls_v4_p{MIN_PIXELS}.tif" for f, _ in STATIC_DATES]
+    paths += [OUT / f"fused_{n}_Cls_v4_p{MIN_PIXELS}.tif" for n in ("union", "majority")]
+    return dict(zip([f for f, _ in layers()], paths))
 
 
 def _sieve(path: Path, out: Path) -> Path:
@@ -292,8 +322,7 @@ def stage_label(maps: Dict[str, Path]) -> None:
     """Field polygons for each map, each in its own folder."""
     import subprocess
 
-    for (folder, _), key in zip(LAYERS, ["timeseries", "10Aug", "30Aug", "09Sep",
-                                         "union", "majority"]):
+    for folder, _ in layers():
         target = OUT / "outputs" / folder
         if (target / "fields_cane.parquet").exists():
             log.info("%s already labelled", folder)
@@ -305,9 +334,10 @@ def stage_label(maps: Dict[str, Path]) -> None:
             # what actually returns the memory.
             subprocess.run(
                 [sys.executable, str(SCRIPTS_DIR / "label_field_polygons_tiled.py"),
-                 "--crop-map", str(maps[key]), "--out", str(target),
+                 "--crop-map", str(maps[folder]), "--out", str(target),
                  "--min-acres", str(MIN_ACRES), "--jobs", str(LABEL_JOBS),
-                 "--no-gpkg"],
+                 "--tile-km", str(LABEL_TILE_KM),
+                 "--delineation", str(DELINEATION), "--no-gpkg"],
                 check=True)
 
 
@@ -320,7 +350,7 @@ def stage_gpkg() -> None:
     """
     import geopandas as gpd
 
-    for folder, _ in LAYERS:
+    for folder, _ in layers():
         target = OUT / "outputs" / folder
         for name in ("fields_labelled", "fields_cane"):
             source = target / f"{name}.parquet"
@@ -331,22 +361,41 @@ def stage_gpkg() -> None:
                 gpd.read_parquet(source).to_file(written, driver="GPKG")
 
 
+def _overlap_acres(geoms) -> float:
+    """How much ground the polygons claim twice, without unioning them.
+
+    The question was never what the union is, it is whether any two polygons cover the
+    same ground. An STRtree answers that directly: it returns the candidate pairs in C,
+    and only those pairs are intersected. Neighbours sharing an edge come back as
+    candidates and fall out on their own, because a shared edge has no area.
+    `union_all` on 140,000 polygons noded every edge in the layer to answer the same
+    question and took a quarter of an hour a layer; this takes seconds.
+
+    Ground covered by three polygons is counted once per pair, so the figure is an
+    upper bound -- which is the safe direction for a number that exists to decide
+    whether the acreage is billable as it stands.
+    """
+    import shapely
+
+    tree = shapely.STRtree(geoms)
+    left, right = tree.query(geoms, predicate="intersects")
+    keep = left < right          # each pair once, and never a polygon against itself
+    left, right = left[keep], right[keep]
+    if len(left) == 0:
+        return 0.0
+    area = shapely.area(shapely.intersection(geoms[left], geoms[right]))
+    return float(area.sum()) / SQM_PER_ACRE
+
+
 def stage_summary() -> None:
     """One table per question: what each map holds, and what each layer delivers."""
     import geopandas as gpd
     import pandas as pd
 
-    maps = {
-        "01_timeseries": OUT / f"rf_sieved_p{MIN_PIXELS}.tif",
-        "02_static_10Aug": OUT / f"static_10_Aug_2026_Cls_v4_p{MIN_PIXELS}.tif",
-        "03_static_30Aug": OUT / f"static_30_Aug_2026_Cls_v4_p{MIN_PIXELS}.tif",
-        "04_static_09Sep": OUT / f"static_09_Sep_2026_Cls_v4_p{MIN_PIXELS}.tif",
-        "05_fused_union": OUT / f"fused_union_Cls_v4_p{MIN_PIXELS}.tif",
-        "06_fused_majority": OUT / f"fused_majority_Cls_v4_p{MIN_PIXELS}.tif",
-    }
+    maps = layer_maps()
 
     rows = []
-    for (folder, what) in LAYERS:
+    for (folder, what) in layers():
         raster = maps[folder]
         row = {"layer": folder, "what it is": what,
                "raster acres": round(_acres(raster)) if raster.exists() else None}
@@ -359,8 +408,7 @@ def stage_summary() -> None:
                                if raster.exists() and _acres(raster) else None)
             # The number that decides whether dissolve is needed: if the polygons
             # overlap, a client adding up the acreage is billed for ground twice.
-            union = frame.geometry.union_all().area / SQM_PER_ACRE
-            row["double counted"] = round(frame.area.sum() / SQM_PER_ACRE - union, 3)
+            row["double counted"] = round(_overlap_acres(frame.geometry.to_numpy()), 3)
         rows.append(row)
 
     table = pd.DataFrame(rows)
@@ -378,18 +426,23 @@ def stage_summary() -> None:
         with rasterio.open(path) as src:
             return src.read(1) == CROP_CLASS
 
-    if all(maps[k].exists() for k in ["02_static_10Aug", "03_static_30Aug",
-                                      "04_static_09Sep", "05_fused_union",
-                                      "06_fused_majority"]):
-        a, b, c = (read(maps["02_static_10Aug"]), read(maps["03_static_30Aug"]),
-                   read(maps["04_static_09Sep"]))
-        union, majority = read(maps["05_fused_union"]), read(maps["06_fused_majority"])
+    names = [f for f, _ in layers()]
+    static_folders, fused = names[1:-2], names[-2:]
+    if all(maps[k].exists() for k in names[1:]):
+        each = [read(maps[f]) for f in static_folders]
+        union, majority = read(maps[fused[0]]), read(maps[fused[1]])
         ac = lambda m: float(m.sum()) * 100 / SQM_PER_ACRE
+        agree = each[0].copy()
+        for m in each[1:]:
+            agree &= m
         print("\nWHERE THE DATES DISAGREE")
-        print(f"  all three agree it is cane      {ac(a & b & c):>9,.0f} acres")
-        print(f"  only 10 August                  {ac(a & ~b & ~c):>9,.0f} acres")
-        print(f"  only 30 August                  {ac(b & ~a & ~c):>9,.0f} acres")
-        print(f"  only 9 September                {ac(c & ~a & ~b):>9,.0f} acres")
+        print(f"  {'all dates agree it is cane':30s}  {ac(agree):>9,.0f} acres")
+        for (folder, what), mine in zip(layers()[1:1 + len(each)], each):
+            alone = mine.copy()
+            for other in each:
+                if other is not mine:
+                    alone &= ~other
+            print(f"  {'only ' + what.replace('static v4 on ', ''):30s}  {ac(alone):>9,.0f} acres")
         print(f"\n  union minus majority            {ac(union & ~majority):>9,.0f} acres")
         print("  that difference is what one date alone claims: recovered harvest if")
         print("  the date is right, an inherited false positive if it is not.")
@@ -413,8 +466,37 @@ def main() -> None:
     parser.add_argument("--jobs", type=int, default=3,
                         help="worker processes; each holds a tile's whole time series, "
                              "so this is limited by memory rather than by cores")
+    parser.add_argument("--aoi", type=Path, default=None,
+                        help="the AOI shapefile; its parent becomes the output root")
+    parser.add_argument("--out", type=Path, default=None,
+                        help="where the run writes, defaults to <aoi parent>/cane_<year>")
+    parser.add_argument("--delineation", type=Path, default=None,
+                        help="the field delineation the labelling stage labels")
+    parser.add_argument("--label-jobs", type=int, default=None,
+                        help="tiles labelled at once; each holds its tile's whole "
+                             "delineation, so this is a memory budget")
+    parser.add_argument("--tile-km", type=float, default=None,
+                        help="labelling tile size. What bounds peak memory is polygons "
+                             "per tile, not tiles: RYK carries 2.2x Al-Moiz's polygons "
+                             "per square kilometre, so its tiles have to be smaller")
+    parser.add_argument("--static-dates", default=None,
+                        help="comma-separated YYYY-MM-DD for the static images; "
+                             "defaults to the Al-Moiz dates")
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s", datefmt="%H:%M:%S")
+
+    global AOI_SHP, OUT, TIMINGS, DELINEATION, STATIC_DATES, LABEL_JOBS, LABEL_TILE_KM
+    LABEL_JOBS = args.label_jobs or LABEL_JOBS
+    LABEL_TILE_KM = args.tile_km or LABEL_TILE_KM
+    if args.static_dates:
+        STATIC_DATES = [(datetime.strptime(d, "%Y-%m-%d").strftime("%d_%b_%Y"), d)
+                        for d in (x.strip() for x in args.static_dates.split(","))]
+    if args.aoi:
+        AOI_SHP = args.aoi
+        OUT = args.out or AOI_SHP.parent / "cane_2026"
+        TIMINGS = OUT / "stage_timings.json"
+    if args.delineation:
+        DELINEATION = args.delineation
 
     stages = (["timeseries", "sieve", "static", "fuse", "label", "gpkg", "summary"]
               if args.stage == "all" else [args.stage])
@@ -432,14 +514,7 @@ def main() -> None:
         with Timed("fuse"):
             stage_fuse([OUT / f"static_{f}_Cls_v4_p{MIN_PIXELS}.tif" for f, _ in STATIC_DATES])
     if "label" in stages:
-        stage_label({
-            "timeseries": mask,
-            "10Aug": OUT / f"static_10_Aug_2026_Cls_v4_p{MIN_PIXELS}.tif",
-            "30Aug": OUT / f"static_30_Aug_2026_Cls_v4_p{MIN_PIXELS}.tif",
-            "09Sep": OUT / f"static_09_Sep_2026_Cls_v4_p{MIN_PIXELS}.tif",
-            "union": OUT / f"fused_union_Cls_v4_p{MIN_PIXELS}.tif",
-            "majority": OUT / f"fused_majority_Cls_v4_p{MIN_PIXELS}.tif",
-        })
+        stage_label(layer_maps())
     if "gpkg" in stages:
         stage_gpkg()
     if "summary" in stages:

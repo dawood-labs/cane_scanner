@@ -108,6 +108,7 @@ def label_one(index, core, wgs, args, scratch, cache_dir, total):
         [sys.executable, str(SCRIPTS_DIR / "label_field_polygons.py"),
          "--crop-map", str(clipped), "--out", str(tile_dir),
          "--min-acres", str(args.min_acres), "--threshold", str(args.threshold),
+         *(["--delineation", str(args.delineation)] if args.delineation else []),
          "--cache", str(cache_dir / f"tile_{index:03d}.parquet"),
          "--no-gpkg"],
         check=True, stdout=subprocess.DEVNULL)
@@ -141,6 +142,7 @@ def main() -> None:
                         help="write GeoParquet only. GeoPackage takes a minute per "
                              "layer at this size where Parquet takes seconds, so a run "
                              "producing six layers writes them all at the end instead.")
+    parser.add_argument("--delineation", type=Path, default=None)
     parser.add_argument("--min-acres", type=float, default=0.15)
     parser.add_argument("--threshold", type=float, default=0.5)
     parser.add_argument("--cache-dir", type=Path, default=None,
@@ -164,8 +166,11 @@ def main() -> None:
     grid = tiles_for(bounds, args.tile_km)
     log.info("%d tiles of %.0f km over the map", len(grid), args.tile_km)
 
-    from label_field_polygons import DELINEATION
-    cache_dir = args.cache_dir or DELINEATION.parent / "repair_cache"
+    from label_field_polygons import DELINEATION as _DEFAULT
+    delineation = args.delineation or _DEFAULT
+    # Each delineation layer gets its own cache: the key includes the source path, so
+    # sharing one folder between AOIs would rebuild on every switch.
+    cache_dir = args.cache_dir or delineation.parent / "repair_cache"
     cache_dir.mkdir(parents=True, exist_ok=True)
 
     scratch = args.out / "_tiles"
