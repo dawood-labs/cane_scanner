@@ -44,17 +44,34 @@ repository is public and the acreages are client results.
   the owner saying so.
 - **`dawood-labs/cropstack` is a different repo** holding FAO/cotton work on its `main`.
   Do not push this project's work there. It has never been run end to end.
-- Notebook `scripts/plot_pixel_data_validation.ipynb` outputs contain client pixel
-  data. Clear outputs before committing it, or leave it uncommitted.
+
+## What a fresh clone needs
+
+The code runs on a new AOI with no data from earlier AOIs. Three things are not in git
+and must be provided:
+
+| what | where the code looks |
+|---|---|
+| time-series RandomForest | `model_files/best_rf_classifier_v4.joblib` |
+| static XGBoost v4 **and its sidecar** | `model_files/fao_cane_xgb_model_v4.json`, `model_files/fao_cane_xgb_model_v4.sidecar.json` |
+| the new AOI shapefile and its field delineation shapefile | anywhere; passed with `--aoi` and `--delineation` |
+
+The sidecar is not optional: without it inference falls back to threshold 0.5 and no
+domain guard, and still runs, so the mistake is silent. Always pass `--delineation`
+too; the default points at an Al-Moiz path that will not exist. Imagery comes from
+public STAC catalogues (Planetary Computer, Earth Search), so no cloud credentials are
+needed for this pipeline.
 
 ## Machine and memory
 
 WSL2, 12 cores, about 11 GB RAM plus 8 GB swap. **Memory is the binding constraint,
-not cores.** An OOM here kills the whole WSL session, so every heavy run goes under a
-process-tree watchdog: a small bash wrapper that launches the command, sums the RSS of
-the *whole process tree* every second (children from `ProcessPoolExecutor` hold the
-memory, not the parent), and `kill -9`s the tree past `LIMIT_MB`. Use `LIMIT_MB=10000`.
-A wrapper that watches only the parent PID reads near zero while the machine fills up.
+not cores.** An OOM here kills the whole WSL session, so every heavy run goes under
+`scripts/capped.sh`, a process-tree watchdog: it sums the RSS of the *whole process
+tree* every second (children from `ProcessPoolExecutor` hold the memory, not the
+parent), `kill -9`s the tree past `LIMIT_MB` (default 10000) and exits 99 with a
+`WATCHDOG:` line. It always prints `PEAK_RSS_MB`; read that before raising any jobs
+or tile-size flag. On a machine with a different amount of RAM, set `LIMIT_MB` to
+roughly 1 GB under what `free -m` reports available.
 
 Settings that are known to fit:
 
@@ -102,14 +119,15 @@ A=/path/to/AOI.shp
 D=/path/to/Delineation.shp
 DATES=2026-08-10,2026-08-30,2026-09-14
 COMMON="--aoi $A --delineation $D --static-dates $DATES"
+RUN="bash capped.sh python3 run_full_aoi.py"
 
-python3 run_full_aoi.py --stage timeseries --jobs 6 --fetch-jobs 3 $COMMON
-python3 run_full_aoi.py --stage sieve   $COMMON
-python3 run_full_aoi.py --stage static  $COMMON
-python3 run_full_aoi.py --stage fuse    $COMMON
-python3 run_full_aoi.py --stage label   --label-jobs 6 --tile-km 8 $COMMON
-python3 run_full_aoi.py --stage gpkg    $COMMON
-python3 run_full_aoi.py --stage summary $COMMON
+$RUN --stage timeseries --jobs 6 --fetch-jobs 3 $COMMON
+$RUN --stage sieve   $COMMON
+$RUN --stage static  $COMMON
+$RUN --stage fuse    $COMMON
+$RUN --stage label   --label-jobs 6 --tile-km 8 $COMMON
+$RUN --stage gpkg    $COMMON
+$RUN --stage summary $COMMON
 ```
 
 `--stage all` runs them in order. Every stage skips work already on disk, so a killed
